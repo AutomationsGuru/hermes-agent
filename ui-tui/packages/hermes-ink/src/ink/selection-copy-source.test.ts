@@ -269,4 +269,138 @@ describe('getSelectedText copy-source override', () => {
     // Region's row 1 is outside selection → partial → fall back to cells.
     expect(getSelectedText(sel, screen)).toBe('abc')
   })
+
+  // ── Nested regions (msg-level + per-block) ──
+  // The TUI wraps each message in <Box copySource={msg.text}> AND each
+  // markdown block in <Box copySource={blockSource}>. Children render
+  // AFTER parents in render-node-to-output, so child cells overwrite the
+  // parent's copySource ID — only padding/gaps keep the parent ID. The
+  // parent's bounding rect (computed from its remaining cells) still
+  // approximates its visual extent so containment-based shadowing works.
+  it('emits only the outer source when both outer and inner regions are fully covered', () => {
+    const styles = new StylePool()
+    const charPool = new CharPool()
+    const copySourcePool = new CopySourcePool()
+    const screen = createScreen(20, 4, styles, charPool, new HyperlinkPool(), copySourcePool)
+
+    for (let i = 0; i < 5; i++) {
+      setCellAt(screen, 2 + i, 1, {
+        char: 'hello'[i]!,
+        hyperlink: undefined,
+        styleId: screen.emptyStyleId,
+        width: CellWidth.Narrow
+      })
+    }
+
+    // Outer: msg-level wrapper covers the whole screen rect.
+    const outerId = copySourcePool.intern('# msg context\n\n**hello**\n\nmore msg')
+    markCopySourceRegion(screen, 0, 0, 20, 4, outerId)
+
+    // Inner: block-level wrapper for "hello", overwrites outer cells in
+    // its rect — same order as render-node-to-output (parent first).
+    const innerId = copySourcePool.intern('**hello**')
+    markCopySourceRegion(screen, 2, 1, 5, 1, innerId)
+
+    const sel = createSelectionState()
+    startSelection(sel, 0, 0)
+    updateSelection(sel, 19, 3)
+
+    // Both fully covered, but outer strictly contains inner → emit outer only.
+    expect(getSelectedText(sel, screen)).toBe('# msg context\n\n**hello**\n\nmore msg')
+  })
+
+  it('emits only the inner source when the selection covers just one block', () => {
+    const styles = new StylePool()
+    const charPool = new CharPool()
+    const copySourcePool = new CopySourcePool()
+    const screen = createScreen(20, 4, styles, charPool, new HyperlinkPool(), copySourcePool)
+
+    // Two "blocks" rendered as plain text, both within an outer msg region.
+    for (let i = 0; i < 5; i++) {
+      setCellAt(screen, i, 0, {
+        char: 'hello'[i]!,
+        hyperlink: undefined,
+        styleId: screen.emptyStyleId,
+        width: CellWidth.Narrow
+      })
+    }
+
+    for (let i = 0; i < 5; i++) {
+      setCellAt(screen, i, 2, {
+        char: 'world'[i]!,
+        hyperlink: undefined,
+        styleId: screen.emptyStyleId,
+        width: CellWidth.Narrow
+      })
+    }
+
+    // Outer covers rows 0..3 (incl. gap rows 1, 3).
+    const outerId = copySourcePool.intern('**hello**\n\n*world*')
+    markCopySourceRegion(screen, 0, 0, 20, 4, outerId)
+
+    // Inner blocks
+    const helloId = copySourcePool.intern('**hello**')
+    const worldId = copySourcePool.intern('*world*')
+    markCopySourceRegion(screen, 0, 0, 5, 1, helloId)
+    markCopySourceRegion(screen, 0, 2, 5, 1, worldId)
+
+    // Selection covers only the "hello" block on row 0.
+    const sel = createSelectionState()
+    startSelection(sel, 0, 0)
+    updateSelection(sel, 4, 0)
+
+    // helloId fully covered (its on-screen cells all in the selection).
+    // outerId NOT fully covered (rows 1-3 outside selection).
+    // worldId NOT fully covered (its row outside selection).
+    expect(getSelectedText(sel, screen)).toBe('**hello**')
+  })
+
+  it('emits multiple inner blocks when outer is partially selected but inners are fully covered', () => {
+    const styles = new StylePool()
+    const charPool = new CharPool()
+    const copySourcePool = new CopySourcePool()
+    const screen = createScreen(20, 5, styles, charPool, new HyperlinkPool(), copySourcePool)
+
+    // Three blocks on rows 0, 2, 4 — outer covers rows 0..4
+    for (const row of [0, 2, 4]) {
+      for (let i = 0; i < 3; i++) {
+        setCellAt(screen, i, row, {
+          char: 'abc'[i]!,
+          hyperlink: undefined,
+          styleId: screen.emptyStyleId,
+          width: CellWidth.Narrow
+        })
+      }
+    }
+
+    const outerId = copySourcePool.intern('OUTER')
+    markCopySourceRegion(screen, 0, 0, 20, 5, outerId)
+
+    const block1Id = copySourcePool.intern('# h1')
+    const block2Id = copySourcePool.intern('# h2')
+    const block3Id = copySourcePool.intern('# h3')
+    markCopySourceRegion(screen, 0, 0, 3, 1, block1Id)
+    markCopySourceRegion(screen, 0, 2, 3, 1, block2Id)
+    markCopySourceRegion(screen, 0, 4, 3, 1, block3Id)
+
+    // Selection covers rows 0..2 → blocks 1 and 2 fully covered; outer NOT
+    // (row 4 cells outside selection); block3 NOT (row 4 outside).
+    const sel = createSelectionState()
+    startSelection(sel, 0, 0)
+    updateSelection(sel, 19, 2)
+
+    expect(getSelectedText(sel, screen)).toBe('# h1\n# h2')
+  })
+
+  it('keeps the single fully-covered region (no shadowing partner exists)', () => {
+    // Sanity: containment filter must be a no-op when there's only one
+    // fully-covered region.
+    const { screen } = screenWithCopySource('hi', '# hi heading')
+
+    const sel = createSelectionState()
+    startSelection(sel, 0, 0)
+    updateSelection(sel, 19, 0)
+
+    expect(getSelectedText(sel, screen)).toBe('# hi heading')
+  })
 })

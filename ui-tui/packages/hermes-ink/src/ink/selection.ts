@@ -998,7 +998,13 @@ export function getSelectedText(s: SelectionState, screen: Screen): string {
   // the selection rect — only then is it safe to substitute the source
   // string (a partial selection has no obvious sub-mapping from rendered
   // cells back to source characters; v1 punts on that case).
-  const fullyCovered = computeFullyCoveredCopySources(screen, start, end)
+  //
+  // `emit`: regions whose source we'll write out. Excludes inner regions
+  //         shadowed by an outer fully-covered region (parent-wins).
+  // `coveredAll`: the un-filtered set, including shadowed ones — used
+  //         by the row-segment loop to know "this segment's cells are
+  //         already accounted for by an outer emission, skip".
+  const { emit, coveredAll } = computeFullyCoveredCopySources(screen, start, end)
 
   // Track which copy-source IDs we've already emitted (one source string
   // covers many rows; we flush it once at the first row of the region in
@@ -1034,8 +1040,11 @@ export function getSelectedText(s: SelectionState, screen: Screen): string {
         segEnd++
       }
 
-      if (segId !== 0 && fullyCovered.has(segId)) {
-        if (!emittedIds.has(segId)) {
+      if (segId !== 0 && coveredAll.has(segId)) {
+        // This segment's cells are entirely covered by SOME fully-covered
+        // region. Emit our source IFF we're in the post-shadowing emit
+        // set; otherwise an outer region's emission already handles us.
+        if (emit.has(segId) && !emittedIds.has(segId)) {
           emittedIds.add(segId)
           const source = screen.copySourcePool.get(segId)
 
@@ -1045,8 +1054,7 @@ export function getSelectedText(s: SelectionState, screen: Screen): string {
             joinRows(lines, source, false)
           }
         }
-        // else: already emitted — skip this segment, the earlier
-        // emission's source string already covers all rows of this region.
+        // else: shadowed inner OR already emitted — skip silently.
       } else {
         const bounds = selectionContentBounds(screen, row, segStart, segEnd)
         const segText = bounds ? extractRowText(screen, row, bounds.first, bounds.last) : ''
@@ -1088,7 +1096,7 @@ function computeFullyCoveredCopySources(
   screen: Screen,
   start: { col: number; row: number },
   end: { col: number; row: number }
-): Set<number> {
+): { coveredAll: Set<number>; emit: Set<number> } {
   const cs = screen.copySources
   const w = screen.width
   const h = screen.height
@@ -1113,7 +1121,7 @@ function computeFullyCoveredCopySources(
   }
 
   if (ids.size === 0) {
-    return ids
+    return { coveredAll: ids, emit: ids }
   }
 
   // Second pass: for each candidate ID, scan the WHOLE screen and find
@@ -1179,7 +1187,50 @@ function computeFullyCoveredCopySources(
     fullyCovered.add(id)
   }
 
-  return fullyCovered
+  // Fourth pass: nested-region shadowing. When a parent <Box copySource>
+  // wraps child <Box copySource> regions, BOTH may end up fully covered
+  // when the selection spans the parent. Without filtering we'd emit
+  // parent.source AND every child.source — duplicating content.
+  //
+  // Drop a region from the EMIT set when ANOTHER fully-covered region's
+  // bounding rect strictly contains it (parent contains child, parent
+  // wins — its source already includes the child's text). Both regions
+  // remain in `coveredAll` so the row-segment loop knows a shadowed
+  // child's cells are accounted for by the parent (don't fall back to
+  // rendered cells when scanning across them).
+  if (fullyCovered.size > 1) {
+    const emit = new Set<number>(fullyCovered)
+
+    for (const innerId of fullyCovered) {
+      const inner = idBounds.get(innerId)!
+
+      for (const outerId of fullyCovered) {
+        if (innerId === outerId) {
+          continue
+        }
+
+        const outer = idBounds.get(outerId)!
+        const containsRow = outer.minRow <= inner.minRow && outer.maxRow >= inner.maxRow
+        const containsCol = outer.minCol <= inner.minCol && outer.maxCol >= inner.maxCol
+
+        const strictlyLarger =
+          outer.minRow < inner.minRow ||
+          outer.maxRow > inner.maxRow ||
+          outer.minCol < inner.minCol ||
+          outer.maxCol > inner.maxCol
+
+        if (containsRow && containsCol && strictlyLarger) {
+          emit.delete(innerId)
+
+          break
+        }
+      }
+    }
+
+    return { coveredAll: fullyCovered, emit }
+  }
+
+  return { coveredAll: fullyCovered, emit: fullyCovered }
 }
 
 /**

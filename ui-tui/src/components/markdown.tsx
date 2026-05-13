@@ -382,6 +382,18 @@ function MdImpl({ compact, t, text }: MdProps) {
 
     const lines = ensureEmojiPresentation(text).split('\n')
     const nodes: ReactNode[] = []
+    // Parallel array: nodeRanges[k] = { start, end } means nodes[k] (and any
+    // contiguous run sharing the same range) was emitted by the block
+    // covering source lines [start..end). Used after the parse to wrap
+    // each block's rendered nodes in a <Box copySource=...> so partial
+    // selections of an individual block (one paragraph, one heading, one
+    // code fence) round-trip the raw markdown for THAT block.
+    //
+    // Outer msg-level copySource on <MessageLine> covers the whole
+    // message; the per-block wraps shadow it only when the selection
+    // covers a single block (see computeFullyCoveredCopySources's
+    // containment check).
+    const nodeRanges: Array<{ end: number; start: number } | null> = []
 
     let prevKind: Kind = null
     let i = 0
@@ -402,8 +414,24 @@ function MdImpl({ compact, t, text }: MdProps) {
     }
 
     while (i < lines.length) {
-      const line = lines[i]!
-      const key = nodes.length
+      // Track this iteration's block range so we can wrap whatever it
+      // pushes in a <Box copySource=...> covering the raw source lines.
+      // Selection that fully covers this block's rendered cells will
+      // copy the original markdown (asterisks, fences, headings, etc.)
+      // instead of the stripped render. Outer msg-level copySource on
+      // <MessageLine> still wins for whole-message selections via the
+      // shadowing logic in getSelectedText.
+      const blockStart = i
+      const beforeCount = nodes.length
+
+      // Labeled inner block: each branch's `break blockIter` exits to
+      // the wrap step below instead of skipping it (which a plain
+      // `continue` on the outer while would do). The branches still
+      // advance `i` themselves so the loop progresses normally.
+       
+      blockIter: {
+        const line = lines[i]!
+        const key = nodes.length
 
       if (!line.trim()) {
         if (!compact) {
@@ -412,13 +440,13 @@ function MdImpl({ compact, t, text }: MdProps) {
 
         i++
 
-        continue
+        break blockIter
       }
 
       if (AUDIO_DIRECTIVE_RE.test(line)) {
         i++
 
-        continue
+        break blockIter
       }
 
       const media = line.match(MEDIA_LINE_RE)?.[1]
@@ -438,7 +466,7 @@ function MdImpl({ compact, t, text }: MdProps) {
         )
         i++
 
-        continue
+        break blockIter
       }
 
       const fence = line.match(FENCE_RE)
@@ -467,7 +495,7 @@ function MdImpl({ compact, t, text }: MdProps) {
           start('paragraph')
           nodes.push(<Md compact={compact} key={key} t={t} text={block.join('\n')} />)
 
-          continue
+          break blockIter
         }
 
         start('code')
@@ -514,7 +542,7 @@ function MdImpl({ compact, t, text }: MdProps) {
           </Box>
         )
 
-        continue
+        break blockIter
       }
 
       const mathOpen = line.match(MATH_BLOCK_OPEN_RE)
@@ -542,7 +570,7 @@ function MdImpl({ compact, t, text }: MdProps) {
           )
           i++
 
-          continue
+          break blockIter
         }
 
         // Multi-line block: scan ahead for a real closer before committing.
@@ -563,7 +591,7 @@ function MdImpl({ compact, t, text }: MdProps) {
           nodes.push(<MdInline key={key} t={t} text={line} />)
           i++
 
-          continue
+          break blockIter
         }
 
         if (headRest.trim()) {
@@ -592,7 +620,7 @@ function MdImpl({ compact, t, text }: MdProps) {
         )
         i = closeIdx + 1
 
-        continue
+        break blockIter
       }
 
       const heading = line.match(HEADING_RE)?.[2]
@@ -606,7 +634,7 @@ function MdImpl({ compact, t, text }: MdProps) {
         )
         i++
 
-        continue
+        break blockIter
       }
 
       if (i + 1 < lines.length && SETEXT_RE.test(lines[i + 1]!)) {
@@ -618,7 +646,7 @@ function MdImpl({ compact, t, text }: MdProps) {
         )
         i += 2
 
-        continue
+        break blockIter
       }
 
       if (HR_RE.test(line)) {
@@ -630,7 +658,7 @@ function MdImpl({ compact, t, text }: MdProps) {
         )
         i++
 
-        continue
+        break blockIter
       }
 
       const footnote = line.match(FOOTNOTE_RE)
@@ -655,7 +683,7 @@ function MdImpl({ compact, t, text }: MdProps) {
           i++
         }
 
-        continue
+        break blockIter
       }
 
       if (i + 1 < lines.length && DEF_RE.test(lines[i + 1]!)) {
@@ -683,7 +711,7 @@ function MdImpl({ compact, t, text }: MdProps) {
           i++
         }
 
-        continue
+        break blockIter
       }
 
       const bullet = line.match(BULLET_RE)
@@ -704,7 +732,7 @@ function MdImpl({ compact, t, text }: MdProps) {
         )
         i++
 
-        continue
+        break blockIter
       }
 
       const numbered = line.match(NUMBERED_RE)
@@ -721,7 +749,7 @@ function MdImpl({ compact, t, text }: MdProps) {
         )
         i++
 
-        continue
+        break blockIter
       }
 
       if (QUOTE_RE.test(line)) {
@@ -748,7 +776,7 @@ function MdImpl({ compact, t, text }: MdProps) {
           </Box>
         )
 
-        continue
+        break blockIter
       }
 
       if (line.includes('|') && i + 1 < lines.length && isTableDivider(lines[i + 1]!)) {
@@ -762,13 +790,13 @@ function MdImpl({ compact, t, text }: MdProps) {
 
         nodes.push(renderTable(key, rows, t))
 
-        continue
+        break blockIter
       }
 
       if (/^<\/?details\b/i.test(line)) {
         i++
 
-        continue
+        break blockIter
       }
 
       const summary = line.match(/^<summary>(.*?)<\/summary>$/i)?.[1]
@@ -782,7 +810,7 @@ function MdImpl({ compact, t, text }: MdProps) {
         )
         i++
 
-        continue
+        break blockIter
       }
 
       if (/^<\/?[^>]+>$/.test(line.trim())) {
@@ -794,7 +822,7 @@ function MdImpl({ compact, t, text }: MdProps) {
         )
         i++
 
-        continue
+        break blockIter
       }
 
       if (line.includes('|') && line.trim().startsWith('|')) {
@@ -816,17 +844,68 @@ function MdImpl({ compact, t, text }: MdProps) {
           nodes.push(renderTable(key, rows, t))
         }
 
-        continue
+        break blockIter
       }
 
       start('paragraph')
       nodes.push(<MdInline key={key} t={t} text={line} />)
       i++
+      }
+      // End blockIter: the body either fell through (final paragraph
+      // case above advanced i and pushed) or `break blockIter`'d out
+      // of an explicit branch. Either way `i` is now past this block.
+
+      // Wrap step: every node pushed during this iteration belongs to
+      // the same block (lines [blockStart, i)). Record the range — the
+      // post-loop pass will splice each block's nodes into a
+      // <Box copySource=...> wrapper.
+      const blockEnd = i
+      const range = blockEnd > blockStart ? { end: blockEnd, start: blockStart } : null
+
+      for (let k = beforeCount; k < nodes.length; k++) {
+        nodeRanges[k] = range
+      }
     }
 
-    cacheSet(bucket, cacheKey, nodes)
+    // Post-process: group consecutive nodes with the same block range
+    // and wrap each group in a <Box copySource={raw block source}>.
+    // Nodes with no range (gap pushes) stay flat.
+    const wrapped: ReactNode[] = []
+    let groupStart = 0
 
-    return nodes
+    while (groupStart < nodes.length) {
+      const range = nodeRanges[groupStart] ?? null
+
+      if (!range) {
+        wrapped.push(nodes[groupStart]!)
+        groupStart++
+
+        continue
+      }
+
+      let groupEnd = groupStart + 1
+
+      while (groupEnd < nodes.length && nodeRanges[groupEnd] === range) {
+        groupEnd++
+      }
+
+      const blockSource = lines.slice(range.start, range.end).join('\n')
+      const groupNodes = nodes.slice(groupStart, groupEnd)
+      // Single-node groups skip the extra Box layer when possible — but
+      // we still need a wrapper to carry copySource. flexDirection=
+      // 'column' matches the parent Box at line ~860 so layout stays
+      // identical to the unwrapped version.
+      wrapped.push(
+        <Box copySource={blockSource} flexDirection="column" key={`md-block-${groupStart}`}>
+          {groupNodes}
+        </Box>
+      )
+      groupStart = groupEnd
+    }
+
+    cacheSet(bucket, cacheKey, wrapped)
+
+    return wrapped
   }, [compact, t, text])
 
   return <Box flexDirection="column">{nodes}</Box>
