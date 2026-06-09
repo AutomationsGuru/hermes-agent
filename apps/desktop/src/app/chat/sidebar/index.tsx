@@ -126,7 +126,7 @@ const WORKSPACE_PAGE = 5
 // ALL-profiles view: show only the latest N per profile up front to keep the
 // unified list scannable, then reveal/fetch more in N-sized steps on demand.
 const PROFILE_INITIAL_PAGE = 5
-const COMPACT_SIDEBAR_MAX_HEIGHT_PX = 830
+const COMPACT_SECTION_STACK_MAX_HEIGHT_PX = 520
 const GROUP_DND_ID_PREFIX = 'group:'
 
 const groupDndId = (id: string) => `${GROUP_DND_ID_PREFIX}${id}`
@@ -137,28 +137,32 @@ const parseGroupDndId = (id: string) =>
 const countLabel = (loaded: number, total: number) => (total > loaded ? `${loaded}/${total}` : String(loaded))
 const sessionTime = (s: SessionInfo) => s.last_active || s.started_at || 0
 
+// Compact mode collapses every section into one shared scroller when the
+// section stack itself is short — measured on the element (not the window) so
+// titlebar/statusbar chrome and OS differences don't skew the threshold. A
+// callback ref (re)attaches the observer whenever the stack mounts, since it
+// renders conditionally.
 function useCompactSidebarSections() {
-  const [compact, setCompact] = useState(() =>
-    typeof window === 'undefined'
-      ? false
-      : window.matchMedia(`(max-height: ${COMPACT_SIDEBAR_MAX_HEIGHT_PX}px)`).matches
-  )
+  const [compact, setCompact] = useState(false)
+  const observerRef = useRef<ResizeObserver | null>(null)
 
-  useEffect(() => {
-    if (typeof window === 'undefined') {
+  const stackRef = useCallback((node: HTMLDivElement | null) => {
+    observerRef.current?.disconnect()
+    observerRef.current = null
+
+    if (!node || typeof ResizeObserver === 'undefined') {
       return
     }
 
-    const query = window.matchMedia(`(max-height: ${COMPACT_SIDEBAR_MAX_HEIGHT_PX}px)`)
-    const sync = () => setCompact(query.matches)
+    const sync = () => setCompact(node.clientHeight < COMPACT_SECTION_STACK_MAX_HEIGHT_PX)
+    const observer = new ResizeObserver(sync)
 
     sync()
-    query.addEventListener('change', sync)
-
-    return () => query.removeEventListener('change', sync)
+    observer.observe(node)
+    observerRef.current = observer
   }, [])
 
-  return compact
+  return { compact, stackRef }
 }
 
 function orderByIds<T>(items: T[], getId: (item: T) => string, orderIds: string[]): T[] {
@@ -362,7 +366,7 @@ export function ChatSidebar({
   const [messagingOpen, setMessagingOpen] = useState<Record<string, boolean>>({})
   const searchInputRef = useRef<HTMLInputElement>(null)
   const trimmedQuery = searchQuery.trim()
-  const compactSections = useCompactSidebarSections()
+  const { compact: compactSections, stackRef: sectionStackRef } = useCompactSidebarSections()
 
   // Hotkey (session.focusSearch) → focus the field once it's mounted.
   useEffect(() => {
@@ -842,6 +846,7 @@ export function ChatSidebar({
               'flex min-h-0 flex-1 flex-col pb-1.75',
               compactSections ? 'overflow-y-auto overscroll-contain' : 'overflow-hidden'
             )}
+            ref={sectionStackRef}
           >
             {trimmedQuery && (
               <SidebarSessionsSection
