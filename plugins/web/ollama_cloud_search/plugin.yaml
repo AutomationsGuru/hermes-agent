@@ -1,0 +1,7 @@
+name: web-ollama-cloud-search
+version: 1.0.0
+description: "Ollama Cloud Search — web search via Ollama's /api/web_search endpoint. Requires OLLAMA_API_KEY from https://ollama.com/settings. Search-only; pair with a separate extract backend such as Tavily."
+author: NousResearch
+kind: backend
+provides_web_providers:
+  - ollama-cloud-search

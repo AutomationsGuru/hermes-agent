@@ -37,7 +37,13 @@ from typing import Any, Dict, Iterator, List, Optional
 
 import httpx
 
-from agent import google_oauth
+from agent import google_antigravity_bridge, google_oauth
+from agent.gemini_cloudcode_models import (
+    GOOGLE_GEMINI_CLI_ROUTE_ANTIGRAVITY,
+    google_gemini_cli_route_from_extra_body,
+    resolve_google_gemini_cli_model_alias,
+    strip_google_gemini_cli_route_hint,
+)
 from agent.gemini_schema import sanitize_gemini_tool_parameters
 from agent.google_code_assist import (
     CODE_ASSIST_ENDPOINT,
@@ -56,8 +62,8 @@ logger = logging.getLogger(__name__)
 _ROLE_MAP_OPENAI_TO_GEMINI = {
     "user": "user",
     "assistant": "model",
-    "system": "user",   # handled separately via systemInstruction
-    "tool": "user",     # functionResponse is wrapped in a user-role turn
+    "system": "user",  # handled separately via systemInstruction
+    "tool": "user",  # functionResponse is wrapped in a user-role turn
     "function": "user",
 }
 
@@ -78,7 +84,10 @@ def _coerce_content_to_text(content: Any) -> str:
                     pieces.append(p["text"])
                 # Multimodal (image_url, etc.) — stub for now; log and skip
                 elif p.get("type") in {"image_url", "input_audio"}:
-                    logger.debug("Dropping multimodal part (not yet supported): %s", p.get("type"))
+                    logger.debug(
+                        "Dropping multimodal part (not yet supported): %s",
+                        p.get("type"),
+                    )
         return "\n".join(pieces)
     return str(content)
 
@@ -317,6 +326,7 @@ def wrap_code_assist_request(
 # Response translation: Gemini → OpenAI
 # =============================================================================
 
+
 def _translate_gemini_response(
     resp: Dict[str, Any],
     model: str,
@@ -358,15 +368,19 @@ def _translate_gemini_response(
                 args_str = json.dumps(fc.get("args") or {}, ensure_ascii=False)
             except (TypeError, ValueError):
                 args_str = "{}"
-            tool_calls.append(SimpleNamespace(
-                id=f"call_{uuid.uuid4().hex[:12]}",
-                type="function",
-                index=i,
-                function=SimpleNamespace(name=str(fc["name"]), arguments=args_str),
-            ))
+            tool_calls.append(
+                SimpleNamespace(
+                    id=f"call_{uuid.uuid4().hex[:12]}",
+                    type="function",
+                    index=i,
+                    function=SimpleNamespace(name=str(fc["name"]), arguments=args_str),
+                )
+            )
 
-    finish_reason = "tool_calls" if tool_calls else _map_gemini_finish_reason(
-        str(cand.get("finishReason") or "")
+    finish_reason = (
+        "tool_calls"
+        if tool_calls
+        else _map_gemini_finish_reason(str(cand.get("finishReason") or ""))
     )
 
     usage_meta = inner.get("usageMetadata") or {}
@@ -404,12 +418,18 @@ def _translate_gemini_response(
 
 def _empty_response(model: str) -> SimpleNamespace:
     message = SimpleNamespace(
-        role="assistant", content="", tool_calls=None,
-        reasoning=None, reasoning_content=None, reasoning_details=None,
+        role="assistant",
+        content="",
+        tool_calls=None,
+        reasoning=None,
+        reasoning_content=None,
+        reasoning_details=None,
     )
     choice = SimpleNamespace(index=0, message=message, finish_reason="stop")
     usage = SimpleNamespace(
-        prompt_tokens=0, completion_tokens=0, total_tokens=0,
+        prompt_tokens=0,
+        completion_tokens=0,
+        total_tokens=0,
         prompt_tokens_details=SimpleNamespace(cached_tokens=0),
     )
     return SimpleNamespace(
@@ -437,8 +457,10 @@ def _map_gemini_finish_reason(reason: str) -> str:
 # Streaming SSE iterator
 # =============================================================================
 
+
 class _GeminiStreamChunk(SimpleNamespace):
     """Mimics an OpenAI ChatCompletionChunk with .choices[0].delta."""
+
     pass
 
 
@@ -460,15 +482,17 @@ def _make_stream_chunk(
     if content:
         delta_kwargs["content"] = content
     if tool_call_delta is not None:
-        delta_kwargs["tool_calls"] = [SimpleNamespace(
-            index=tool_call_delta.get("index", 0),
-            id=tool_call_delta.get("id") or f"call_{uuid.uuid4().hex[:12]}",
-            type="function",
-            function=SimpleNamespace(
-                name=tool_call_delta.get("name") or "",
-                arguments=tool_call_delta.get("arguments") or "",
-            ),
-        )]
+        delta_kwargs["tool_calls"] = [
+            SimpleNamespace(
+                index=tool_call_delta.get("index", 0),
+                id=tool_call_delta.get("id") or f"call_{uuid.uuid4().hex[:12]}",
+                type="function",
+                function=SimpleNamespace(
+                    name=tool_call_delta.get("name") or "",
+                    arguments=tool_call_delta.get("arguments") or "",
+                ),
+            )
+        ]
     if reasoning:
         delta_kwargs["reasoning"] = reasoning
         delta_kwargs["reasoning_content"] = reasoning
@@ -535,9 +559,12 @@ def _translate_stream_event(
         if not isinstance(part, dict):
             continue
         if part.get("thought") is True and isinstance(part.get("text"), str):
-            chunks.append(_make_stream_chunk(
-                model=model, reasoning=part["text"],
-            ))
+            chunks.append(
+                _make_stream_chunk(
+                    model=model,
+                    reasoning=part["text"],
+                )
+            )
             continue
         if isinstance(part.get("text"), str) and part["text"]:
             chunks.append(_make_stream_chunk(model=model, content=part["text"]))
@@ -550,14 +577,16 @@ def _translate_stream_event(
                 args_str = json.dumps(fc.get("args") or {}, ensure_ascii=False)
             except (TypeError, ValueError):
                 args_str = "{}"
-            chunks.append(_make_stream_chunk(
-                model=model,
-                tool_call_delta={
-                    "index": idx,
-                    "name": name,
-                    "arguments": args_str,
-                },
-            ))
+            chunks.append(
+                _make_stream_chunk(
+                    model=model,
+                    tool_call_delta={
+                        "index": idx,
+                        "name": name,
+                        "arguments": args_str,
+                    },
+                )
+            )
 
     finish_reason_raw = str(cand.get("finishReason") or "")
     if finish_reason_raw:
@@ -611,7 +640,9 @@ class GeminiCloudCodeClient:
         self._project_context_lock = False  # simple single-thread guard
         self.chat = _GeminiChatNamespace(self)
         self.is_closed = False
-        self._http = httpx.Client(timeout=httpx.Timeout(connect=15.0, read=600.0, write=30.0, pool=30.0))
+        self._http = httpx.Client(
+            timeout=httpx.Timeout(connect=15.0, read=600.0, write=30.0, pool=30.0)
+        )
 
     def close(self) -> None:
         self.is_closed = True
@@ -678,12 +709,35 @@ class GeminiCloudCodeClient:
         timeout: Any = None,
         **_: Any,
     ) -> Any:
+        selected_model = model
+        model, extra_body = resolve_google_gemini_cli_model_alias(model, extra_body)
+        route = google_gemini_cli_route_from_extra_body(extra_body)
+        extra_body = strip_google_gemini_cli_route_hint(extra_body)
+
+        if route == GOOGLE_GEMINI_CLI_ROUTE_ANTIGRAVITY:
+            prompt = google_antigravity_bridge.build_antigravity_prompt(messages or [])
+            text = google_antigravity_bridge.get_model_response(
+                model_enum=model,
+                prompt=prompt,
+            )
+            if stream:
+                return google_antigravity_bridge.stream_antigravity_text_response(
+                    text,
+                    selected_model,
+                )
+            return google_antigravity_bridge.translate_antigravity_text_response(
+                text,
+                selected_model,
+            )
+
         access_token = google_oauth.get_valid_access_token()
         ctx = self._ensure_project_context(access_token, model)
 
         thinking_config = None
         if isinstance(extra_body, dict):
-            thinking_config = extra_body.get("thinking_config") or extra_body.get("thinkingConfig")
+            thinking_config = extra_body.get("thinking_config") or extra_body.get(
+                "thinkingConfig"
+            )
 
         inner = build_gemini_request(
             messages=messages or [],
@@ -712,7 +766,9 @@ class GeminiCloudCodeClient:
         headers.update(self._default_headers)
 
         if stream:
-            return self._stream_completion(model=model, wrapped=wrapped, headers=headers)
+            return self._stream_completion(
+                model=selected_model, wrapped=wrapped, headers=headers
+            )
 
         url = f"{CODE_ASSIST_ENDPOINT}/v1internal:generateContent"
         response = self._http.post(url, json=wrapped, headers=headers)
@@ -725,7 +781,7 @@ class GeminiCloudCodeClient:
                 f"Invalid JSON from Code Assist: {exc}",
                 code="code_assist_invalid_json",
             ) from exc
-        return _translate_gemini_response(payload, model=model)
+        return _translate_gemini_response(payload, model=selected_model)
 
     def _stream_completion(
         self,
@@ -741,14 +797,18 @@ class GeminiCloudCodeClient:
 
         def _generator() -> Iterator[_GeminiStreamChunk]:
             try:
-                with self._http.stream("POST", url, json=wrapped, headers=stream_headers) as response:
+                with self._http.stream(
+                    "POST", url, json=wrapped, headers=stream_headers
+                ) as response:
                     if response.status_code != 200:
                         # Materialize error body for better diagnostics
                         response.read()
                         raise _gemini_http_error(response)
                     tool_call_counter: List[int] = [0]
                     for event in _iter_sse_events(response):
-                        for chunk in _translate_stream_event(event, model, tool_call_counter):
+                        for chunk in _translate_stream_event(
+                            event, model, tool_call_counter
+                        ):
                             yield chunk
             except httpx.HTTPError as exc:
                 raise CodeAssistError(
@@ -836,7 +896,9 @@ def _gemini_http_error(response: httpx.Response) -> CodeAssistError:
     # Fall back to the Retry-After header if the body didn't include RetryInfo.
     if retry_delay_seconds is None:
         try:
-            header_val = response.headers.get("Retry-After") or response.headers.get("retry-after")
+            header_val = response.headers.get("Retry-After") or response.headers.get(
+                "retry-after"
+            )
         except Exception:
             header_val = None
         if header_val:
@@ -861,7 +923,9 @@ def _gemini_http_error(response: httpx.Response) -> CodeAssistError:
     # Google signal.
     model_hint = ""
     if isinstance(error_metadata, dict):
-        model_hint = str(error_metadata.get("model") or error_metadata.get("modelId") or "").strip()
+        model_hint = str(
+            error_metadata.get("model") or error_metadata.get("modelId") or ""
+        ).strip()
 
     if status == 429 and error_reason == "MODEL_CAPACITY_EXHAUSTED":
         target = model_hint or "this Gemini model"

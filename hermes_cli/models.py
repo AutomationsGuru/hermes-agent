@@ -17,6 +17,10 @@ from pathlib import Path
 from typing import Any, NamedTuple, Optional
 
 from hermes_cli import __version__ as _HERMES_VERSION
+from agent.gemini_cloudcode_models import (
+    GOOGLE_GEMINI_CLI_CURATED_MODELS,
+    build_google_gemini_cli_picker_models,
+)
 
 # Identify ourselves so endpoints fronted by Cloudflare's Browser Integrity
 # Check (error 1010) don't reject the default ``Python-urllib/*`` signature.
@@ -244,17 +248,7 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         "gemini-3.5-flash",
         "gemini-3.1-flash-lite-preview",
     ],
-    "google-gemini-cli": [
-        "gemini-3.1-pro-preview",
-        "gemini-3-pro-preview",
-        # Code Assist serves two flash slugs with different access gates
-        # (gemini-cli models.ts): gemini-3-flash-preview is the preview flash
-        # that subscription/free-tier OAuth users actually reach, while
-        # gemini-3.5-flash is GA-channel-gated. Offer both so non-GA users
-        # aren't stuck with a slug cloudcode-pa 404s for them.
-        "gemini-3-flash-preview",
-        "gemini-3.5-flash",
-    ],
+    "google-gemini-cli": list(GOOGLE_GEMINI_CLI_CURATED_MODELS),
     "zai": [
         "glm-5.1",
         "glm-5",
@@ -2148,6 +2142,26 @@ def _merge_with_models_dev(provider: str, curated: list[str]) -> list[str]:
     return merged
 
 
+def _fetch_google_gemini_cli_quota_model_ids() -> list[str]:
+    """Best-effort live model IDs from Code Assist quota buckets.
+
+    Cloud Code Assist does not expose a public OpenAI-style /models endpoint,
+    but retrieveUserQuota returns bucket model IDs for the authenticated
+    account. Treat those as the account-specific live catalog supplement.
+    """
+    try:
+        from agent.google_oauth import get_valid_access_token, load_credentials
+        from agent.google_code_assist import retrieve_user_quota
+
+        access_token = get_valid_access_token()
+        creds = load_credentials()
+        project_id = (creds.project_id if creds else "") or ""
+        buckets = retrieve_user_quota(access_token, project_id=project_id)
+        return [b.model_id for b in buckets if getattr(b, "model_id", "")]
+    except Exception:
+        return []
+
+
 def provider_model_ids(provider: Optional[str], *, force_refresh: bool = False) -> list[str]:
     """Return the best known model catalog for a provider.
 
@@ -2178,6 +2192,10 @@ def provider_model_ids(provider: Optional[str], *, force_refresh: bool = False) 
         return get_codex_model_ids(access_token=access_token)
     if normalized == "xai-oauth":
         return list(_PROVIDER_MODELS.get("xai-oauth", _PROVIDER_MODELS.get("xai", [])))
+    if normalized == "google-gemini-cli":
+        return build_google_gemini_cli_picker_models(
+            _fetch_google_gemini_cli_quota_model_ids()
+        )
     if normalized in {"copilot", "copilot-acp"}:
         try:
             live = _fetch_github_models(_resolve_copilot_catalog_api_key())
