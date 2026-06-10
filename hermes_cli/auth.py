@@ -6149,6 +6149,28 @@ def _reset_config_provider() -> Path:
     return config_path
 
 
+def _antigravity_chat_only_suffix(mid: str) -> str:
+    """Selection-time marker for Antigravity models that are chat-only (no tools).
+
+    Gated to the ``antigravity-`` picker IDs so the real anthropic/openai
+    catalogs (whose raw slugs alias-resolve) are never mis-marked in other
+    providers' pickers. Reads the per-model capability source of truth.
+    """
+
+    if not str(mid).startswith("antigravity-"):
+        return ""
+    try:
+        from agent.gemini_cloudcode_models import (
+            google_gemini_cli_model_capabilities,
+        )
+
+        if google_gemini_cli_model_capabilities(mid).get("chat_only"):
+            return "  (chat-only, no tools)"
+    except Exception:
+        pass
+    return ""
+
+
 def _prompt_model_selection(
     model_ids: List[str],
     current_model: str = "",
@@ -6216,6 +6238,7 @@ def _prompt_model_selection(
             base = f"{mid:<{name_col}}{price_part}"
         else:
             base = mid
+        base += _antigravity_chat_only_suffix(mid)
         if mid == current_model:
             base += "  ← currently in use"
         return base

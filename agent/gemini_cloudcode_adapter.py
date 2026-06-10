@@ -39,6 +39,8 @@ import httpx
 
 from agent import google_oauth
 from agent.gemini_cloudcode_models import (
+    ANTIGRAVITY_TOOL_ENABLED_ENUMS,
+    ANTIGRAVITY_TOOL_UNRELIABLE_ENUMS,
     GOOGLE_GEMINI_CLI_ROUTE_ANTIGRAVITY,
     google_gemini_cli_route_from_extra_body,
     is_antigravity_backend_model,
@@ -166,10 +168,19 @@ def _build_antigravity_cascade_prompt(messages: List[Dict[str, Any]]) -> str:
         role = str(message.get("role") or "user").strip().lower()
         label = role_labels.get(role, role.title() if role else "User")
         content = _coerce_content_to_antigravity_text(message.get("content"))
+        if role in {"tool", "function"}:
+            # Tool results round-trip so the model sees the outcome of the call
+            # it made on a previous turn (Hermes-side tool loop, Option A).
+            tname = str(message.get("name") or "").strip()
+            header = f"Tool result ({tname})" if tname else "Tool result"
+            lines.append(f"{header}: {content}")
+            continue
         if content:
             lines.append(f"{label}: {content}")
         if role == "assistant" and message.get("tool_calls"):
-            lines.append("Assistant: [tool calls omitted]")
+            rendered = _render_assistant_tool_calls(message.get("tool_calls"))
+            if rendered:
+                lines.append(f"Assistant (tool call): {rendered}")
     return "\n\n".join(lines).strip()
 
 
@@ -196,29 +207,276 @@ def _merge_antigravity_assistant_text(current: str, new_text: str) -> str:
     return f"{current}{text}"
 
 
-def _iter_antigravity_cascade_deltas(
+# =============================================================================
+# Option A — Hermes-side tool calling over the text-only Cascade route.
+#
+# The route is a plain LLM: tool definitions are rendered into a system
+# preamble, the model replies with a strict-JSON tool call, and we parse it back
+# into OpenAI `tool_calls`. Tool *results* round-trip as labelled text on the
+# next turn. Nothing executes inside Antigravity — Hermes owns the tool loop.
+# =============================================================================
+
+_ANTIGRAVITY_TOOL_PREAMBLE_HEADER = (
+    "You are connected to an external host that executes tools on your behalf. "
+    "IGNORE any built-in tools, IDE actions, or native tool syntax you would "
+    "normally use — in THIS conversation the ONLY tools that exist are the ones "
+    "listed below, and they ARE available to you right now. You have NO workspace "
+    "and cannot read files, list directories, search, or run commands yourself; "
+    "do not attempt to, and do not produce planning/task/walkthrough artifacts.\n\n"
+    "To use a tool, the host requires you to reply with a SINGLE JSON object of "
+    "EXACTLY this shape and NOTHING else — no explanation, no markdown, no code "
+    "fences, no native tool syntax:\n"
+    '{"tool_calls": [{"name": "<tool_name>", "arguments": {<json args>}}]}\n'
+    "The host parses that JSON, runs the tool, and returns the result to you as a "
+    "'Tool result' message. IMPORTANT: once a 'Tool result' that answers the "
+    "request is already present in the conversation, do NOT call the tool again "
+    "— reply with a plain-text answer to the user using that result. If the "
+    "request does not need any of the listed tools, reply normally as plain text."
+)
+
+
+_ANTIGRAVITY_TOOL_SYNTHESIS_PREAMBLE = (
+    "You are connected to an external host. Earlier in this conversation you "
+    "requested a tool and the host has already returned its output as a 'Tool "
+    "result' message below. Use those tool results to answer the user's question "
+    "directly, in plain natural-language text. Do NOT emit another JSON tool call "
+    "unless you genuinely still need information that is not present in any tool "
+    "result. Do not restate the raw JSON; give the user a normal answer."
+)
+
+
+def _antigravity_last_message_is_tool_result(messages: Any) -> bool:
+    """True if the most recent non-system message is a tool result."""
+
+    for message in reversed(messages or []):
+        if not isinstance(message, dict):
+            continue
+        role = str(message.get("role") or "").strip().lower()
+        if role in {"tool", "function"}:
+            return True
+        if role in {"user", "assistant", "developer"}:
+            return False
+    return False
+
+
+def _antigravity_tool_names(tools: Any) -> list[str]:
+    names: list[str] = []
+    for tool in tools or []:
+        if not isinstance(tool, dict):
+            continue
+        fn = tool.get("function") if isinstance(tool.get("function"), dict) else tool
+        name = str((fn or {}).get("name") or "").strip()
+        if name:
+            names.append(name)
+    return names
+
+
+def _render_antigravity_tool_preamble(tools: Any, tool_choice: Any) -> str:
+    """Render OpenAI tool definitions into a deterministic system preamble."""
+
+    lines: List[str] = [_ANTIGRAVITY_TOOL_PREAMBLE_HEADER, "", "Available tools:"]
+    example_name = None
+    for tool in tools or []:
+        if not isinstance(tool, dict):
+            continue
+        fn = tool.get("function") if isinstance(tool.get("function"), dict) else tool
+        if not isinstance(fn, dict):
+            continue
+        name = str(fn.get("name") or "").strip()
+        if not name:
+            continue
+        if example_name is None:
+            example_name = name
+        desc = str(fn.get("description") or "").strip()
+        params = fn.get("parameters")
+        try:
+            params_json = json.dumps(params, ensure_ascii=False) if params else "{}"
+        except (TypeError, ValueError):
+            params_json = "{}"
+        line = f"- {name}: {desc}" if desc else f"- {name}"
+        lines.append(f"{line}\n  parameters (JSON Schema): {params_json}")
+
+    # Tool-choice forcing: nudge the model to call (a specific) tool.
+    if isinstance(tool_choice, dict):
+        forced = (tool_choice.get("function") or {}).get("name")
+        if forced:
+            lines.append(f"\nYou MUST call the tool {forced!r} now.")
+    elif isinstance(tool_choice, str) and tool_choice == "required":
+        lines.append("\nYou MUST call one of the available tools now.")
+
+    if example_name:
+        lines.append(
+            '\nExample of a valid reply: {"tool_calls": [{"name": '
+            f'"{example_name}", "arguments": {{}}}}]}}'
+        )
+    return "\n".join(lines)
+
+
+def _iter_json_object_candidates(text: str) -> Iterator[str]:
+    """Yield each balanced top-level ``{...}`` substring, in order.
+
+    String-aware brace matching so braces inside JSON string values don't throw
+    off the depth count. Tolerant of prose/code fences and of several objects
+    concatenated together (e.g. a model that emits a tool call more than once).
+    """
+
+    s = str(text or "")
+    i = 0
+    n = len(s)
+    while i < n:
+        if s[i] != "{":
+            i += 1
+            continue
+        depth = 0
+        in_str = False
+        escape = False
+        end = None
+        for j in range(i, n):
+            ch = s[j]
+            if in_str:
+                if escape:
+                    escape = False
+                elif ch == "\\":
+                    escape = True
+                elif ch == '"':
+                    in_str = False
+                continue
+            if ch == '"':
+                in_str = True
+            elif ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    end = j
+                    break
+        if end is None:
+            return  # unbalanced from here on
+        yield s[i : end + 1]
+        i = end + 1
+
+
+def _extract_first_json_object(text: str) -> Optional[str]:
+    """Return the first balanced ``{...}`` JSON object substring, or None."""
+
+    for candidate in _iter_json_object_candidates(text):
+        return candidate
+    return None
+
+
+def _normalize_antigravity_tool_calls(obj: Any, valid_names: set[str]) -> list[dict]:
+    """Coerce a parsed JSON object into OpenAI tool_calls, or [] if not one.
+
+    Accepts ``{"tool_calls": [...]}``, ``{"tool_call": {...}}``, and a bare
+    ``{"name": ..., "arguments": {...}}``. A call is kept only if its name is one
+    of the offered tools (so ordinary JSON in a normal answer is not mistaken for
+    a tool call).
+    """
+
+    if not isinstance(obj, dict):
+        return []
+    raw_calls: list[Any]
+    if isinstance(obj.get("tool_calls"), list):
+        raw_calls = obj["tool_calls"]
+    elif isinstance(obj.get("tool_call"), dict):
+        raw_calls = [obj["tool_call"]]
+    elif "name" in obj and "arguments" in obj:
+        raw_calls = [obj]
+    else:
+        return []
+
+    out: list[dict] = []
+    for call in raw_calls:
+        if not isinstance(call, dict):
+            continue
+        fn = call.get("function") if isinstance(call.get("function"), dict) else call
+        name = str((fn or {}).get("name") or "").strip()
+        if not name or (valid_names and name not in valid_names):
+            continue
+        args = (fn or {}).get("arguments", {})
+        if isinstance(args, str):
+            args_str = args
+        else:
+            try:
+                args_str = json.dumps(args, ensure_ascii=False)
+            except (TypeError, ValueError):
+                args_str = "{}"
+        out.append(
+            {
+                "id": f"call_{uuid.uuid4().hex[:24]}",
+                "type": "function",
+                "function": {"name": name, "arguments": args_str},
+            }
+        )
+    return out
+
+
+def _parse_antigravity_tool_calls(text: str, valid_names: set[str]) -> list[dict]:
+    """Best-effort extraction of OpenAI tool_calls from a Cascade reply.
+
+    Scans every balanced JSON object in the text and returns the first that
+    yields a valid tool call, so trailing junk or a duplicated emission does not
+    defeat parsing.
+    """
+
+    for candidate in _iter_json_object_candidates(text):
+        try:
+            obj = json.loads(candidate)
+        except (ValueError, TypeError):
+            continue
+        calls = _normalize_antigravity_tool_calls(obj, valid_names)
+        if calls:
+            return calls
+    return []
+
+
+def _render_assistant_tool_calls(tool_calls: Any) -> str:
+    """Render prior OpenAI assistant tool_calls back to the JSON the model emits."""
+
+    calls: list[dict] = []
+    for call in tool_calls or []:
+        if not isinstance(call, dict):
+            continue
+        fn = call.get("function") if isinstance(call.get("function"), dict) else call
+        name = str((fn or {}).get("name") or "").strip()
+        if not name:
+            continue
+        raw_args = (fn or {}).get("arguments", {})
+        if isinstance(raw_args, str):
+            try:
+                args = json.loads(raw_args) if raw_args.strip() else {}
+            except (ValueError, TypeError):
+                args = raw_args
+        else:
+            args = raw_args
+        calls.append({"name": name, "arguments": args})
+    if not calls:
+        return ""
+    try:
+        return json.dumps({"tool_calls": calls}, ensure_ascii=False)
+    except (TypeError, ValueError):
+        return ""
+
+
+def _drive_antigravity_cascade(
     *,
     model_enum: str,
     prompt: str,
 ) -> Iterator[tuple[str, str]]:
-    """Yield ``("delta", suffix)`` tuples, then one final ``("finish", reason)``.
+    """Run one Cascade turn, yielding raw ``("assistant_full", full_text)`` for
+    each assistant_text snapshot then a final ``("finish", reason)``.
 
-    Runs the StartCascade -> SendUserCascadeMessage -> StreamAgentStateUpdates
-    sequence and translates the parsed events:
-
-    - ``assistant_text`` events re-emit the full text while generating, so the
-      merged text is tracked (same rules as ``_merge_antigravity_assistant_text``)
-      and only the new suffix is yielded — never duplicated text.
-    - Per-step ``done``/``tool_result`` events never terminate; only the
-      conversation-level signal (``conversation_done=True``) does, mapping to
-      finish_reason ``"stop"``.
-    - Exhausting the event cap mid-generation maps to finish_reason ``"length"``.
-    - ``error`` events and transport failures raise sanitized ``CodeAssistError``.
+    Cascade re-emits the FULL assistant text on each update (not incremental
+    deltas), so each snapshot is the complete reply-so-far. Per-step
+    ``done``/``tool_result`` events never terminate; only the conversation-level
+    ``conversation_done`` does (finish ``"stop"``). Cap exhaustion → ``"length"``;
+    a mid-generation stall after partial output → ``"length"``; ``error`` events
+    and transport failures raise sanitized ``CodeAssistError``.
     """
 
-    merged_text = ""
     conversation_done = False
     events_seen = 0
+    yielded_any = False
     try:
         with AntigravityCascadeClient() as cascade_client:
             session = cascade_client.start_cascade(model_enum=model_enum)
@@ -230,14 +488,8 @@ def _iter_antigravity_cascade_deltas(
                 events_seen += 1
                 event_type = getattr(event, "type", "")
                 if event_type == "assistant_text":
-                    merged = _merge_antigravity_assistant_text(
-                        merged_text,
-                        getattr(event, "text", ""),
-                    )
-                    if len(merged) > len(merged_text):
-                        suffix = merged[len(merged_text):]
-                        merged_text = merged
-                        yield ("delta", suffix)
+                    yielded_any = True
+                    yield ("assistant_full", getattr(event, "text", "") or "")
                 elif event_type == "error":
                     error_text = sanitize_console_text(
                         getattr(event, "text", "") or "unknown error"
@@ -252,10 +504,8 @@ def _iter_antigravity_cascade_deltas(
                     conversation_done = True
                     break
     except AntigravityCascadeError as exc:
-        if getattr(exc, "code", "") == "antigravity_cascade_truncated" and events_seen:
-            # A mid-generation stall after partial output: keep what we received
-            # but report finish_reason="length" so the reply is honestly flagged
-            # incomplete rather than as a clean "stop".
+        if getattr(exc, "code", "") == "antigravity_cascade_truncated" and yielded_any:
+            # Mid-generation stall after partial output: flag incomplete.
             yield ("finish", "length")
             return
         error_text = sanitize_console_text(exc)
@@ -271,18 +521,109 @@ def _iter_antigravity_cascade_deltas(
         yield ("finish", "stop")
 
 
+def _iter_antigravity_cascade_deltas(
+    *,
+    model_enum: str,
+    prompt: str,
+) -> Iterator[tuple[str, str]]:
+    """Yield ``("delta", suffix)`` tuples then a final ``("finish", reason)``.
+
+    Wraps :func:`_drive_antigravity_cascade`, converting full-text re-emissions
+    into suffix-only deltas (never duplicated text) for the streaming chat path.
+    """
+
+    merged_text = ""
+    for kind, value in _drive_antigravity_cascade(
+        model_enum=model_enum, prompt=prompt
+    ):
+        if kind == "assistant_full":
+            merged = _merge_antigravity_assistant_text(merged_text, value)
+            if len(merged) > len(merged_text):
+                suffix = merged[len(merged_text):]
+                merged_text = merged
+                yield ("delta", suffix)
+        elif kind == "finish":
+            yield ("finish", value)
+
+
+def _collect_antigravity_reply(model_enum: str, prompt: str) -> tuple[str, str]:
+    """Drive one turn; return (suffix-merged full_text, finish_reason).
+
+    Used by the plain-chat path where incremental merge semantics are wanted.
+    """
+
+    text = ""
+    finish_reason = "stop"
+    for kind, value in _iter_antigravity_cascade_deltas(
+        model_enum=model_enum, prompt=prompt
+    ):
+        if kind == "delta":
+            text += value
+        elif kind == "finish":
+            finish_reason = value
+    return text, finish_reason
+
+
+def _collect_antigravity_final_reply(model_enum: str, prompt: str) -> tuple[str, str]:
+    """Drive one turn; return (final full-text snapshot, finish_reason).
+
+    For the tools path: takes the last non-empty full re-emission rather than
+    merging suffixes, so a re-ordered/non-prefix re-emission cannot corrupt the
+    tool-call JSON (observed live with GPT-OSS). Falls back to the longest
+    snapshot if the last is empty.
+    """
+
+    last_text = ""
+    longest_text = ""
+    finish_reason = "stop"
+    for kind, value in _drive_antigravity_cascade(
+        model_enum=model_enum, prompt=prompt
+    ):
+        if kind == "assistant_full":
+            if value:
+                last_text = value
+            if len(value) > len(longest_text):
+                longest_text = value
+        elif kind == "finish":
+            finish_reason = value
+    return (last_text or longest_text), finish_reason
+
+
+def _build_antigravity_tool_prompt(messages: List[Dict[str, Any]], preamble: str) -> str:
+    """Prepend the tool-instruction preamble (as a System turn) to the prompt."""
+
+    base = _build_antigravity_cascade_prompt(messages)
+    head = f"System: {preamble}"
+    return f"{head}\n\n{base}" if base else head
+
+
 def _make_antigravity_stream_chunk(
     *,
     model: str,
     content: Optional[str] = None,
     finish_reason: Optional[str] = None,
+    tool_calls: Optional[list] = None,
 ) -> _GeminiStreamChunk:
     """OpenAI-style chat.completion.chunk for the Antigravity Cascade route."""
 
+    tool_call_ns = None
+    if tool_calls:
+        tool_call_ns = [
+            SimpleNamespace(
+                index=i,
+                id=tc["id"],
+                type=tc.get("type", "function"),
+                function=SimpleNamespace(
+                    name=tc["function"]["name"],
+                    arguments=tc["function"]["arguments"],
+                ),
+            )
+            for i, tc in enumerate(tool_calls)
+        ]
     delta = SimpleNamespace(
         role="assistant",
         content=content,
-        tool_calls=None,
+        tool_calls=tool_call_ns,
         reasoning=None,
         reasoning_content=None,
     )
@@ -302,6 +643,7 @@ def _make_antigravity_text_response(
     model: str,
     content: str,
     finish_reason: str = "stop",
+    tool_calls: Optional[list] = None,
 ) -> SimpleNamespace:
     usage = SimpleNamespace(
         prompt_tokens=0,
@@ -309,10 +651,23 @@ def _make_antigravity_text_response(
         total_tokens=0,
         prompt_tokens_details=SimpleNamespace(cached_tokens=0),
     )
+    tool_call_ns = None
+    if tool_calls:
+        tool_call_ns = [
+            SimpleNamespace(
+                id=tc["id"],
+                type=tc.get("type", "function"),
+                function=SimpleNamespace(
+                    name=tc["function"]["name"],
+                    arguments=tc["function"]["arguments"],
+                ),
+            )
+            for tc in tool_calls
+        ]
     message = SimpleNamespace(
         role="assistant",
-        content=str(content or ""),
-        tool_calls=None,
+        content=(None if tool_calls else str(content or "")),
+        tool_calls=tool_call_ns,
         reasoning=None,
         reasoning_content=None,
         reasoning_details=None,
@@ -1034,44 +1389,115 @@ class GeminiCloudCodeClient:
         tools: Any,
         tool_choice: Any,
     ) -> Any:
-        """Route a no-tool chat completion through local Antigravity Cascade."""
+        """Route a chat completion through local Antigravity Cascade.
 
-        if tools:
+        Plain chat uses the streaming/non-stream text path. When ``tools`` are
+        supplied (Option A), the route acts as a pure LLM: tool definitions are
+        rendered into a system preamble, the full reply is buffered and parsed
+        for a strict-JSON tool call, and the result is returned as OpenAI
+        ``tool_calls``. Nothing executes inside Antigravity.
+        """
+
+        tool_names = set(_antigravity_tool_names(tools))
+        wants_tools = bool(tool_names) or _tool_choice_forces_tools(tool_choice)
+        if wants_tools and model_enum not in ANTIGRAVITY_TOOL_ENABLED_ENUMS:
+            if model_enum in ANTIGRAVITY_TOOL_UNRELIABLE_ENUMS:
+                raise CodeAssistError(
+                    "This Antigravity Claude model is available for chat but not "
+                    "for tool calling: wrapped in Antigravity's agent persona it "
+                    "does not reliably emit tool calls over the Cascade route. Use "
+                    "antigravity-gpt-oss-120b-medium for tool-using agent loops, "
+                    "or this model for plain chat.",
+                    code="antigravity_cascade_tools_unsupported",
+                )
             raise CodeAssistError(
-                "Antigravity Cascade provider route does not support Hermes tool calls yet",
+                "Antigravity Cascade tool calling is supported only for "
+                "antigravity-gpt-oss-120b-medium. For Gemini, use the normal "
+                "google provider's tool calling.",
                 code="antigravity_cascade_tools_unsupported",
             )
-        if _tool_choice_forces_tools(tool_choice):
-            raise CodeAssistError(
-                "Antigravity Cascade provider route does not support Hermes tool calls yet",
-                code="antigravity_cascade_tools_unsupported",
+        if not tool_names:
+            # Plain text/chat — unchanged streaming or non-stream behavior.
+            # (A tool_choice with no tools list is a no-op on this route.)
+            prompt = _build_antigravity_cascade_prompt(messages)
+            if stream:
+                return self._stream_antigravity_cascade_completion(
+                    model=model, model_enum=model_enum, prompt=prompt
+                )
+            text, finish_reason = _collect_antigravity_reply(model_enum, prompt)
+            return _make_antigravity_text_response(
+                model=model, content=text, finish_reason=finish_reason
             )
 
-        prompt = _build_antigravity_cascade_prompt(messages)
+        # Tools path: buffer the full reply (a tool call cannot be parsed from a
+        # partial stream), parse it, and emit identically whether or not the
+        # caller asked to stream.
+        # When the latest turn is a tool result, use an answer-focused preamble
+        # so the model synthesizes the result instead of re-calling the tool.
+        if _antigravity_last_message_is_tool_result(messages):
+            preamble = (
+                _ANTIGRAVITY_TOOL_SYNTHESIS_PREAMBLE
+                + "\n\nTools still available if genuinely needed:\n"
+                + "\n".join(f"- {n}" for n in sorted(tool_names))
+            )
+        else:
+            preamble = _render_antigravity_tool_preamble(tools, tool_choice)
+        prompt = _build_antigravity_tool_prompt(messages, preamble)
+        text, finish_reason = _collect_antigravity_final_reply(model_enum, prompt)
+        calls = _parse_antigravity_tool_calls(text, tool_names)
+
+        # One repair retry for stability when a tool call was explicitly required
+        # but the model answered with prose (or malformed JSON).
+        if not calls and _tool_choice_forces_tools(tool_choice):
+            repair = (
+                prompt
+                + "\n\nSystem: Your previous reply was not a valid tool call. "
+                "Reply with ONLY the JSON tool-call object, no prose, no fences."
+            )
+            retry_text, retry_finish = _collect_antigravity_final_reply(
+                model_enum, repair
+            )
+            retry_calls = _parse_antigravity_tool_calls(retry_text, tool_names)
+            if retry_calls:
+                text, finish_reason, calls = retry_text, retry_finish, retry_calls
 
         if stream:
-            return self._stream_antigravity_cascade_completion(
-                model=model,
-                model_enum=model_enum,
-                prompt=prompt,
+            return self._stream_antigravity_cascade_tools(
+                model=model, text=text, calls=calls, finish_reason=finish_reason
+            )
+        if calls:
+            return _make_antigravity_text_response(
+                model=model, content="", finish_reason="tool_calls", tool_calls=calls
+            )
+        return _make_antigravity_text_response(
+            model=model, content=text, finish_reason=finish_reason
+        )
+
+    def _stream_antigravity_cascade_tools(
+        self,
+        *,
+        model: str,
+        text: str,
+        calls: list,
+        finish_reason: str,
+    ) -> Iterator[_GeminiStreamChunk]:
+        """Emit a buffered tools-path result as OpenAI-style stream chunks."""
+
+        def _generator() -> Iterator[_GeminiStreamChunk]:
+            yield _make_antigravity_stream_chunk(model=model)
+            if calls:
+                yield _make_antigravity_stream_chunk(model=model, tool_calls=calls)
+                yield _make_antigravity_stream_chunk(
+                    model=model, finish_reason="tool_calls"
+                )
+                return
+            if text:
+                yield _make_antigravity_stream_chunk(model=model, content=text)
+            yield _make_antigravity_stream_chunk(
+                model=model, finish_reason=finish_reason
             )
 
-        assistant_text = ""
-        finish_reason = "stop"
-        for kind, value in _iter_antigravity_cascade_deltas(
-            model_enum=model_enum,
-            prompt=prompt,
-        ):
-            if kind == "delta":
-                assistant_text += value
-            elif kind == "finish":
-                finish_reason = value
-
-        return _make_antigravity_text_response(
-            model=model,
-            content=assistant_text,
-            finish_reason=finish_reason,
-        )
+        return _generator()
 
     def _stream_antigravity_cascade_completion(
         self,
