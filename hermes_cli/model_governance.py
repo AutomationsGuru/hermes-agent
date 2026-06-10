@@ -36,9 +36,15 @@ APPROVED_PICKER_MODELS: dict[str, tuple[str, ...]] = {
         "gemini-3.1-pro-low",
         "gemini-3.1-pro-high",
         "gemini-3.1-flash-lite",
-        "claude-sonnet-4-6",
-        "claude-opus-4-6-thinking",
-        "gpt-oss-120b-medium",
+        # Cross-vendor presets are namespaced with the antigravity- prefix so
+        # the curated google-gemini-cli picker IDs never shadow the real
+        # anthropic/openai catalogs in provider auto-detection (guarded by
+        # test_google_gemini_cli_curated_ids_do_not_shadow_other_catalogs).
+        # This approved-picker allowlist must match those picker IDs, or the
+        # cross-vendor models would be filtered out of the picker entirely.
+        "antigravity-claude-sonnet-4-6",
+        "antigravity-claude-opus-4-6-thinking",
+        "antigravity-gpt-oss-120b-medium",
     ),
     "minimax": (
         "MiniMax-M3",

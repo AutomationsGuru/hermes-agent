@@ -1,0 +1,9 @@
+{
+  "update": {
+    "conversationId": "conversation-test",
+    "trajectoryId": "trajectory-test",
+    "status": "CASCADE_RUN_STATUS_IDLE",
+    "executableStatus": "CASCADE_RUN_STATUS_IDLE",
+    "executorLoopStatus": "CASCADE_RUN_STATUS_IDLE"
+  }
+}

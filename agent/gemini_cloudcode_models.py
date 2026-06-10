@@ -1,11 +1,11 @@
-"""Model catalog and alias helpers for Google Gemini CLI / Cloud Code Assist.
+"""Model catalog and alias helpers for Google Gemini CLI / Antigravity routes.
 
 Google's app surfaces some choices as product labels such as
-"Gemini 3.5 Flash (High)".  A subset route through Cloud Code Assist's direct
+"Gemini 3.5 Flash (High)". A subset route through Cloud Code Assist's direct
 ``generateContent`` endpoint, while Antigravity-only choices require the local
-Antigravity language-server bridge and its internal model enums.  This module
-keeps picker IDs, backend IDs/enums, and route hints in one place so picker and
-runtime stay aligned.
+Antigravity language-server/Cascade bridge and its internal model enums. This
+module keeps picker IDs, backend IDs/enums, capability metadata, and private
+route hints aligned.
 """
 
 from __future__ import annotations
@@ -31,8 +31,8 @@ class GoogleGeminiCliModelAlias:
     app_slug: str = ""
 
 
-# Slug-safe picker aliases for app-visible presets.  Models marked
-# ``antigravity`` are reachable through the local Antigravity language server
+# Slug-safe picker aliases for app-visible presets. Models marked antigravity
+# are reachable through the local Antigravity language server/Cascade bridge
 # with its internal enum, not through direct cloudcode-pa model slugs.
 GOOGLE_GEMINI_CLI_APP_ALIASES: tuple[GoogleGeminiCliModelAlias, ...] = (
     GoogleGeminiCliModelAlias(
@@ -77,22 +77,26 @@ GOOGLE_GEMINI_CLI_APP_ALIASES: tuple[GoogleGeminiCliModelAlias, ...] = (
         route=GOOGLE_GEMINI_CLI_ROUTE_ANTIGRAVITY,
         app_slug="gemini-3.1-flash-lite",
     ),
+    # Cross-vendor presets are namespaced with an ``antigravity-`` prefix so
+    # the curated google-gemini-cli list never shadows the real anthropic /
+    # openai catalogs in provider auto-detection (e.g. the short aliases
+    # ``sonnet``/``opus``/``gpt`` must keep resolving to their own vendors).
     GoogleGeminiCliModelAlias(
-        picker_id="claude-sonnet-4-6",
+        picker_id="antigravity-claude-sonnet-4-6",
         backend_model="MODEL_PLACEHOLDER_M35",
         app_label="Claude Sonnet 4.6 (Thinking)",
         route=GOOGLE_GEMINI_CLI_ROUTE_ANTIGRAVITY,
         app_slug="claude-sonnet-4-6",
     ),
     GoogleGeminiCliModelAlias(
-        picker_id="claude-opus-4-6-thinking",
+        picker_id="antigravity-claude-opus-4-6-thinking",
         backend_model="MODEL_PLACEHOLDER_M26",
         app_label="Claude Opus 4.6 (Thinking)",
         route=GOOGLE_GEMINI_CLI_ROUTE_ANTIGRAVITY,
         app_slug="claude-opus-4-6-thinking",
     ),
     GoogleGeminiCliModelAlias(
-        picker_id="gpt-oss-120b-medium",
+        picker_id="antigravity-gpt-oss-120b-medium",
         backend_model="MODEL_OPENAI_GPT_OSS_120B_MEDIUM",
         app_label="GPT-OSS 120B (Medium)",
         route=GOOGLE_GEMINI_CLI_ROUTE_ANTIGRAVITY,
@@ -104,10 +108,9 @@ GOOGLE_GEMINI_CLI_APP_MODEL_IDS: list[str] = [
     alias.picker_id for alias in GOOGLE_GEMINI_CLI_APP_ALIASES
 ]
 
-# Offline/static fallback for raw Cloud Code Assist backend IDs.  Account-
-# specific discovery should prefer retrieveUserQuota buckets when available;
-# these keep manual typed use working before auth or when quota endpoint is
-# temporarily unreachable. Governance filters decide what is picker-visible.
+# Offline/static fallback for raw Cloud Code Assist backend IDs. Account-specific
+# discovery should prefer retrieveUserQuota buckets when available; these keep
+# manual typed use working before auth or when quota endpoint is unavailable.
 GOOGLE_GEMINI_CLI_RAW_FALLBACK_MODELS: list[str] = [
     "gemini-3.1-pro-preview",
     "gemini-3-pro-preview",
@@ -124,49 +127,96 @@ def _normalize_alias_key(value: str) -> str:
     return " ".join(str(value or "").strip().lower().split())
 
 
+# Key registration runs in explicit priority passes (lowest first, so later
+# passes overwrite): app_slug < app_label < picker_id. A picker_id shown in
+# the Hermes picker must ALWAYS resolve to its own backend_model, even when
+# Google's raw slug for a *different* tier collides with it. Google's app
+# slugs are shifted one tier relative to displayed labels — their raw slug
+# 'gemini-3.5-flash-low' actually means the Medium preset — so that colliding
+# raw slug intentionally loses to the picker meaning of 'gemini-3.5-flash-low'
+# (the Low alias). Non-colliding raw slugs (e.g. 'gemini-3.5-flash-extra-low')
+# still resolve to their own alias.
 _ALIAS_BY_KEY: dict[str, GoogleGeminiCliModelAlias] = {}
 for _alias in GOOGLE_GEMINI_CLI_APP_ALIASES:
-    _ALIAS_BY_KEY[_normalize_alias_key(_alias.picker_id)] = _alias
-    _ALIAS_BY_KEY[_normalize_alias_key(_alias.app_label)] = _alias
     if _alias.app_slug:
         _ALIAS_BY_KEY[_normalize_alias_key(_alias.app_slug)] = _alias
+for _alias in GOOGLE_GEMINI_CLI_APP_ALIASES:
+    if _alias.app_label:
+        _ALIAS_BY_KEY[_normalize_alias_key(_alias.app_label)] = _alias
+for _alias in GOOGLE_GEMINI_CLI_APP_ALIASES:
+    _ALIAS_BY_KEY[_normalize_alias_key(_alias.picker_id)] = _alias
+
+_ALIAS_BY_PICKER_ID: dict[str, GoogleGeminiCliModelAlias] = {
+    _alias.picker_id: _alias for _alias in GOOGLE_GEMINI_CLI_APP_ALIASES
+}
 
 # Manual spellings that should work even if they are not shown in the picker.
-_ALIAS_BY_KEY.update({
-    "gemini-3-flash-preview-low": GOOGLE_GEMINI_CLI_APP_ALIASES[0],
-    "gemini-3-flash-preview-medium": GOOGLE_GEMINI_CLI_APP_ALIASES[1],
-    "gemini-3-flash-preview-high": GOOGLE_GEMINI_CLI_APP_ALIASES[2],
-    "gemini-3.1-pro-preview-low": GOOGLE_GEMINI_CLI_APP_ALIASES[3],
-    "gemini-3.1-pro-preview-high": GOOGLE_GEMINI_CLI_APP_ALIASES[4],
-    "claude-sonnet-4-6-thinking": GOOGLE_GEMINI_CLI_APP_ALIASES[6],
-    "claude-sonnet-4.6-thinking": GOOGLE_GEMINI_CLI_APP_ALIASES[6],
-    "claude-sonnet-4.6": GOOGLE_GEMINI_CLI_APP_ALIASES[6],
-    "claude-opus-4.6-thinking": GOOGLE_GEMINI_CLI_APP_ALIASES[7],
-})
+# Lowest priority: they only fill keys not already claimed by a picker_id,
+# app_label, or app_slug above. Referenced by picker_id (not list position)
+# so reordering GOOGLE_GEMINI_CLI_APP_ALIASES cannot silently remap them.
+_MANUAL_ALIAS_SPELLINGS: dict[str, str] = {
+    "gemini-3-flash-preview-low": "gemini-3.5-flash-low",
+    "gemini-3-flash-preview-medium": "gemini-3.5-flash-medium",
+    "gemini-3-flash-preview-high": "gemini-3.5-flash-high",
+    "gemini-3.1-pro-preview-low": "gemini-3.1-pro-low",
+    "gemini-3.1-pro-preview-high": "gemini-3.1-pro-high",
+    "claude-sonnet-4-6-thinking": "antigravity-claude-sonnet-4-6",
+    "claude-sonnet-4.6-thinking": "antigravity-claude-sonnet-4-6",
+    "claude-sonnet-4.6": "antigravity-claude-sonnet-4-6",
+    "claude-opus-4.6-thinking": "antigravity-claude-opus-4-6-thinking",
+}
+for _manual_key, _picker_id in _MANUAL_ALIAS_SPELLINGS.items():
+    _ALIAS_BY_KEY.setdefault(
+        _normalize_alias_key(_manual_key), _ALIAS_BY_PICKER_ID[_picker_id]
+    )
+
+
+_ANTIGRAVITY_BACKEND_MODELS: frozenset[str] = frozenset(
+    alias.backend_model
+    for alias in GOOGLE_GEMINI_CLI_APP_ALIASES
+    if alias.route == GOOGLE_GEMINI_CLI_ROUTE_ANTIGRAVITY
+)
+
+
+def is_antigravity_backend_model(model: str) -> bool:
+    """Return whether ``model`` is a curated Antigravity backend enum.
+
+    Used to gate the private antigravity route hint: a caller-supplied hint must
+    never reroute an arbitrary model (e.g. a Cloud Code slug) to Cascade — only
+    enums that alias resolution actually produces for an Antigravity-routed
+    picker entry are eligible.
+    """
+
+    return str(model or "").strip() in _ANTIGRAVITY_BACKEND_MODELS
 
 
 def google_gemini_cli_model_capabilities(model: str) -> dict[str, Any]:
-    """Return Hermes capability metadata for a google-gemini-cli model ID.
-
-    Direct Cloud Code backend IDs stay full adapter models. App-visible
-    Antigravity aliases are intentionally marked text-only until native
-    structured chat/tool-call support is proven for the local API.
-    """
+    """Return Hermes capability metadata for a google-gemini-cli model ID."""
 
     alias = _ALIAS_BY_KEY.get(_normalize_alias_key(model))
     route = alias.route if alias is not None else GOOGLE_GEMINI_CLI_ROUTE_CLOUDCODE
     if route == GOOGLE_GEMINI_CLI_ROUTE_ANTIGRAVITY:
         return {
             "route": GOOGLE_GEMINI_CLI_ROUTE_ANTIGRAVITY,
+            # The Cascade route flattens messages to a single text prompt
+            # (non-text parts are dropped) and rejects Hermes tool calls, so it
+            # is text-only for input — advertise that honestly so upstream does
+            # not send multimodal parts the route would silently degrade.
             "text_only": True,
             "tool_calls": False,
-            "streaming": "synthetic",
+            "observed_workspace_tools": True,
+            "auto_execute_tools": False,
+            "auto_ack_edits": False,
+            "streaming": "parsed_events",
             "requires_local_antigravity": True,
         }
     return {
         "route": GOOGLE_GEMINI_CLI_ROUTE_CLOUDCODE,
         "text_only": False,
         "tool_calls": True,
+        "observed_workspace_tools": False,
+        "auto_execute_tools": True,
+        "auto_ack_edits": False,
         "streaming": "native",
         "requires_local_antigravity": False,
     }
@@ -192,12 +242,7 @@ def dedupe_google_gemini_cli_models(model_ids: Iterable[str]) -> list[str]:
 def build_google_gemini_cli_picker_models(
     live_model_ids: Iterable[str] | None = None,
 ) -> list[str]:
-    """Build the picker list for the google-gemini-cli provider.
-
-    App-style aliases come first, then live quota-discovered Cloud Code backend
-    IDs, then raw fallback IDs for manual/offline use. Picker governance may
-    further hide raw backend IDs from user-facing selection surfaces.
-    """
+    """Build the picker list for the google-gemini-cli provider."""
 
     return dedupe_google_gemini_cli_models([
         *GOOGLE_GEMINI_CLI_APP_MODEL_IDS,
@@ -233,12 +278,7 @@ def resolve_google_gemini_cli_model_alias(
     model: str,
     extra_body: dict[str, Any] | None = None,
 ) -> tuple[str, dict[str, Any] | None]:
-    """Resolve picker/app aliases into a backend model/enum and extra_body.
-
-    Cloud Code aliases may contribute ``thinkingLevel``.  Antigravity aliases
-    carry a private route hint so the runtime calls the local language-server
-    bridge instead of direct ``cloudcode-pa``.
-    """
+    """Resolve picker/app aliases into a backend model/enum and extra_body."""
 
     alias = _ALIAS_BY_KEY.get(_normalize_alias_key(model))
     if alias is None:
@@ -256,8 +296,6 @@ def resolve_google_gemini_cli_model_alias(
         thinking_config = dict(existing) if isinstance(existing, dict) else {}
         thinking_config.setdefault("thinkingLevel", alias.thinking_level)
         merged_extra_body["thinking_config"] = thinking_config
-        # Keep one canonical spelling so downstream code does not have to merge
-        # two equivalent keys.
         merged_extra_body.pop("thinkingConfig", None)
 
     return alias.backend_model, merged_extra_body or None

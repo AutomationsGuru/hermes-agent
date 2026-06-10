@@ -1,0 +1,14 @@
+{
+  "trajectory": {
+    "items": [
+      {
+        "kind": "mcp_tool_call",
+        "toolName": "ListMcpResources",
+        "arguments": {
+          "server": "probe",
+          "api_key": "tool-secret"
+        }
+      }
+    ]
+  }
+}

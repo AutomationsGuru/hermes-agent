@@ -34,29 +34,30 @@ def test_google_oauth_aliases_are_approved_picker_models():
         "gemini-3.1-pro-low",
         "gemini-3.1-pro-high",
         "gemini-3.1-flash-lite",
-        "claude-sonnet-4-6",
-        "claude-opus-4-6-thinking",
-        "gpt-oss-120b-medium",
+        # Namespaced so they don't shadow the real anthropic/openai catalogs.
+        "antigravity-claude-sonnet-4-6",
+        "antigravity-claude-opus-4-6-thinking",
+        "antigravity-gpt-oss-120b-medium",
     )
 
 
 def test_filter_models_keeps_only_approved_models_in_roster_order():
     models = [
         "gemini-3-pro-preview",
-        "gpt-oss-120b-medium",
+        "antigravity-gpt-oss-120b-medium",
         "gemini-3.1-pro-high",
         "gemini-3.5-flash-high",
         "gemini-2.5-pro",
         "gemini-3.5-flash-low",
-        "claude-sonnet-4-6",
+        "antigravity-claude-sonnet-4-6",
     ]
 
     assert filter_models_for_approved_picker("google-gemini-cli", models) == [
         "gemini-3.5-flash-low",
         "gemini-3.5-flash-high",
         "gemini-3.1-pro-high",
-        "claude-sonnet-4-6",
-        "gpt-oss-120b-medium",
+        "antigravity-claude-sonnet-4-6",
+        "antigravity-gpt-oss-120b-medium",
     ]
 
 

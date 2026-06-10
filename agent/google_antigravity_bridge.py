@@ -256,9 +256,12 @@ def get_model_response(
             },
         )
         if response.status_code != 200:
-            body = response.text[:500]
+            # Omit the response body: it may echo request context or sensitive
+            # content, and callers that log the exception would leak it. This
+            # mirrors the cascade client's "response body omitted" discipline.
             raise AntigravityBridgeError(
-                f"Antigravity GetModelResponse HTTP {response.status_code}: {body}",
+                f"Antigravity GetModelResponse HTTP {response.status_code}: "
+                "response body omitted",
                 status_code=response.status_code,
             )
         try:
@@ -310,6 +313,9 @@ def stream_antigravity_text_response(
 ) -> Iterator[SimpleNamespace]:
     """Yield OpenAI-chat-shaped streaming chunks for text-only responses."""
 
+    # All chunks of one completion must share a single id (OpenAI streaming
+    # protocol); generate it once rather than per chunk.
+    response_id = f"chatcmpl-antigravity-{uuid.uuid4().hex[:12]}"
     delta = SimpleNamespace(
         role="assistant",
         content=str(text or ""),
@@ -318,7 +324,7 @@ def stream_antigravity_text_response(
         reasoning_content=None,
     )
     yield SimpleNamespace(
-        id=f"chatcmpl-antigravity-{uuid.uuid4().hex[:12]}",
+        id=response_id,
         object="chat.completion.chunk",
         created=int(time.time()),
         model=model,
@@ -333,7 +339,7 @@ def stream_antigravity_text_response(
         reasoning_content=None,
     )
     yield SimpleNamespace(
-        id=f"chatcmpl-antigravity-{uuid.uuid4().hex[:12]}",
+        id=response_id,
         object="chat.completion.chunk",
         created=int(time.time()),
         model=model,

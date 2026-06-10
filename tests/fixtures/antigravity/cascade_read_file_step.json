@@ -1,0 +1,21 @@
+{
+  "update": {
+    "mainTrajectoryUpdate": {
+      "stepsUpdate": {
+        "steps": [
+          {
+            "type": "CORTEX_STEP_TYPE_READ_FILE",
+            "status": "CORTEX_STEP_STATUS_DONE",
+            "args": {
+              "path": "tests/fixtures/antigravity/cascade_assistant_text.json",
+              "Authorization": "Bearer file-secret"
+            },
+            "result": {
+              "text": "file contained api_key=read-secret"
+            }
+          }
+        ]
+      }
+    }
+  }
+}

@@ -1,0 +1,11 @@
+{
+  "agentState": {
+    "events": [
+      {
+        "type": "cascade_status",
+        "status": "completed",
+        "finishReason": "stop"
+      }
+    ]
+  }
+}
