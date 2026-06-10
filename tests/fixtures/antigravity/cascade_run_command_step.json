@@ -1,0 +1,20 @@
+{
+  "update": {
+    "mainTrajectoryUpdate": {
+      "stepsUpdate": {
+        "steps": [
+          {
+            "type": "CORTEX_STEP_TYPE_RUN_COMMAND",
+            "status": "CORTEX_STEP_STATUS_PENDING",
+            "args": {
+              "command": "python -m pytest --version"
+            },
+            "metadata": {
+              "hermes_auto_executable": false
+            }
+          }
+        ]
+      }
+    }
+  }
+}

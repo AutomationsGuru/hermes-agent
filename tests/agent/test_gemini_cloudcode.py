@@ -16,8 +16,10 @@ import base64
 import hashlib
 import json
 import stat
+import sys
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -215,6 +217,10 @@ class TestCredentialIo:
         assert loaded.refresh_token == "rt-1"
         assert loaded.project_id == "proj-abc"
 
+    @pytest.mark.skipif(
+        sys.platform.startswith("win"),
+        reason="POSIX mode bits are not enforced on Windows",
+    )
     def test_save_uses_0600_permissions(self):
         from agent.google_oauth import _credentials_path, save_credentials
 
@@ -952,6 +958,644 @@ class TestGeminiCloudCodeClient:
         finally:
             client.close()
 
+    def test_normal_gemini_model_uses_oauth_and_project_context(self, monkeypatch):
+        from agent import google_oauth
+        from agent.gemini_cloudcode_adapter import GeminiCloudCodeClient
+        from agent.google_code_assist import ProjectContext
+
+        calls = {"oauth": 0, "project": 0, "post": 0}
+
+        def fake_token():
+            calls["oauth"] += 1
+            return "fake-access-token"
+
+        class FakeResponse:
+            status_code = 200
+
+            def json(self):
+                return {
+                    "response": {
+                        "candidates": [{
+                            "content": {"parts": [{"text": "Gemini OK"}]},
+                            "finishReason": "STOP",
+                        }]
+                    }
+                }
+
+        class FakeHttp:
+            def post(self, url, *, json, headers):
+                calls["post"] += 1
+                assert url.endswith("/v1internal:generateContent")
+                assert json["project"] == "fake-project"
+                assert headers["Authorization"] == "Bearer fake-access-token"
+                return FakeResponse()
+
+            def close(self):
+                pass
+
+        def fake_project_context(access_token, model):
+            calls["project"] += 1
+            assert access_token == "fake-access-token"
+            assert model == "gemini-3-pro-preview"
+            return ProjectContext(
+                project_id="fake-project",
+                managed_project_id="",
+                tier_id="",
+                source="test",
+            )
+
+        monkeypatch.setattr(google_oauth, "get_valid_access_token", fake_token)
+        client = GeminiCloudCodeClient(api_key="dummy")
+        client._http = FakeHttp()
+        monkeypatch.setattr(client, "_ensure_project_context", fake_project_context)
+
+        try:
+            resp = client.chat.completions.create(
+                model="gemini-3-pro-preview",
+                messages=[{"role": "user", "content": "Return OK"}],
+            )
+        finally:
+            client.close()
+
+        assert resp.choices[0].message.content == "Gemini OK"
+        assert calls == {"oauth": 1, "project": 1, "post": 1}
+
+    def test_antigravity_cascade_route_skips_oauth_and_returns_openai_shape(
+        self,
+        monkeypatch,
+    ):
+        from agent import gemini_cloudcode_adapter, google_oauth
+        from agent.gemini_cloudcode_adapter import GeminiCloudCodeClient
+
+        class FakeCascadeClient:
+            instances = []
+
+            def __init__(self):
+                self.calls = []
+                FakeCascadeClient.instances.append(self)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_exc_info):
+                self.calls.append(("close",))
+
+            def start_cascade(self, *, model_enum):
+                self.calls.append(("start", model_enum))
+                return SimpleNamespace(cascade_id="fake-cascade-id")
+
+            def send_user_message(self, cascade_id, message):
+                self.calls.append(("send", cascade_id, message))
+                return 200
+
+            def stream_agent_state_updates(self, cascade_id, *, max_events):
+                self.calls.append(("stream", cascade_id, max_events))
+                yield SimpleNamespace(type="assistant_text", text="OK")
+                yield SimpleNamespace(type="assistant_text", text="OK")
+                yield SimpleNamespace(type="done", text="")
+
+        monkeypatch.setattr(
+            google_oauth,
+            "get_valid_access_token",
+            lambda: pytest.fail("Antigravity route must not call OAuth"),
+        )
+        monkeypatch.setattr(
+            gemini_cloudcode_adapter,
+            "AntigravityCascadeClient",
+            FakeCascadeClient,
+        )
+        client = GeminiCloudCodeClient(api_key="dummy")
+        monkeypatch.setattr(
+            client,
+            "_ensure_project_context",
+            lambda *_args, **_kwargs: pytest.fail(
+                "Antigravity route must not resolve Code Assist project context"
+            ),
+        )
+
+        try:
+            resp = client.chat.completions.create(
+                model="antigravity-cascade",
+                messages=[
+                    {"role": "system", "content": "Be terse"},
+                    {"role": "developer", "content": "Follow exact output"},
+                    {"role": "user", "content": "Return exactly OK."},
+                ],
+            )
+        finally:
+            client.close()
+
+        assert resp.model == "antigravity-cascade"
+        assert resp.choices[0].message.content == "OK"
+        assert resp.choices[0].message.tool_calls is None
+        assert resp.choices[0].finish_reason == "stop"
+        fake = FakeCascadeClient.instances[0]
+        assert fake.calls[0] == ("start", "MODEL_PLACEHOLDER_M132")
+        assert fake.calls[1][0:2] == ("send", "fake-cascade-id")
+        prompt = fake.calls[1][2]
+        assert "System: Be terse" in prompt
+        assert "Developer: Follow exact output" in prompt
+        assert "User: Return exactly OK." in prompt
+        assert fake.calls[2] == (
+            "stream",
+            "fake-cascade-id",
+            gemini_cloudcode_adapter._ANTIGRAVITY_CASCADE_MAX_EVENTS,
+        )
+        assert gemini_cloudcode_adapter._ANTIGRAVITY_CASCADE_MAX_EVENTS == 1000
+
+    def test_antigravity_cascade_model_alias_helpers(self):
+        from agent.gemini_cloudcode_adapter import (
+            is_antigravity_cascade_model,
+            resolve_antigravity_cascade_model_enum,
+        )
+
+        assert is_antigravity_cascade_model("antigravity-cascade")
+        assert is_antigravity_cascade_model("antigravity-cascade-m132")
+        assert resolve_antigravity_cascade_model_enum(
+            "antigravity-cascade"
+        ) == "MODEL_PLACEHOLDER_M132"
+        assert resolve_antigravity_cascade_model_enum(
+            "MODEL_PLACEHOLDER_M132"
+        ) == "MODEL_PLACEHOLDER_M132"
+        assert not is_antigravity_cascade_model("gemini-3-pro-preview")
+
+    def test_google_gemini_cli_app_alias_resolves_to_antigravity_route(self):
+        from agent.gemini_cloudcode_models import (
+            GOOGLE_GEMINI_CLI_ROUTE_ANTIGRAVITY,
+            google_gemini_cli_route_from_extra_body,
+            resolve_google_gemini_cli_model_alias,
+            strip_google_gemini_cli_route_hint,
+        )
+
+        backend_model, extra_body = resolve_google_gemini_cli_model_alias(
+            "gemini-3.5-flash-high",
+            {"caller": "kept"},
+        )
+
+        assert backend_model == "MODEL_PLACEHOLDER_M132"
+        assert (
+            google_gemini_cli_route_from_extra_body(extra_body)
+            == GOOGLE_GEMINI_CLI_ROUTE_ANTIGRAVITY
+        )
+        assert strip_google_gemini_cli_route_hint(extra_body) == {"caller": "kept"}
+
+    def test_google_gemini_cli_app_alias_routes_to_cascade_without_google_oauth(
+        self,
+        monkeypatch,
+    ):
+        from agent import gemini_cloudcode_adapter, google_oauth
+        from agent.gemini_cloudcode_adapter import GeminiCloudCodeClient
+
+        class FakeCascadeClient:
+            instances = []
+
+            def __init__(self):
+                self.calls = []
+                FakeCascadeClient.instances.append(self)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_exc_info):
+                self.calls.append(("close",))
+
+            def start_cascade(self, *, model_enum):
+                self.calls.append(("start", model_enum))
+                return SimpleNamespace(cascade_id="fake-cascade-id")
+
+            def send_user_message(self, cascade_id, message):
+                self.calls.append(("send", cascade_id, message))
+                return 200
+
+            def stream_agent_state_updates(self, cascade_id, *, max_events):
+                self.calls.append(("stream", cascade_id, max_events))
+                yield SimpleNamespace(type="assistant_text", text="ALIAS_OK")
+                yield SimpleNamespace(type="done", text="")
+
+        monkeypatch.setattr(
+            google_oauth,
+            "get_valid_access_token",
+            lambda: pytest.fail("Antigravity app aliases must not call Google OAuth"),
+        )
+        monkeypatch.setattr(
+            gemini_cloudcode_adapter,
+            "AntigravityCascadeClient",
+            FakeCascadeClient,
+        )
+        client = GeminiCloudCodeClient(api_key="dummy")
+        monkeypatch.setattr(
+            client,
+            "_ensure_project_context",
+            lambda *_args, **_kwargs: pytest.fail(
+                "Antigravity app aliases must not resolve Code Assist project context"
+            ),
+        )
+
+        try:
+            resp = client.chat.completions.create(
+                model="gemini-3.5-flash-high",
+                messages=[{"role": "user", "content": "Return exactly ALIAS_OK."}],
+            )
+        finally:
+            client.close()
+
+        assert resp.model == "gemini-3.5-flash-high"
+        assert resp.choices[0].message.content == "ALIAS_OK"
+        fake = FakeCascadeClient.instances[0]
+        assert fake.calls[0] == ("start", "MODEL_PLACEHOLDER_M132")
+        assert "User: Return exactly ALIAS_OK." in fake.calls[1][2]
+
+    @pytest.mark.parametrize(
+        "kwargs",
+        [
+            {"tools": [{"type": "function", "function": {"name": "lookup"}}]},
+            {"tool_choice": "required"},
+            {"tool_choice": {"type": "function", "function": {"name": "lookup"}}},
+        ],
+    )
+    def test_antigravity_cascade_rejects_tool_modes(self, kwargs):
+        from agent.gemini_cloudcode_adapter import GeminiCloudCodeClient
+        from agent.google_code_assist import CodeAssistError
+
+        client = GeminiCloudCodeClient(api_key="dummy")
+        try:
+            with pytest.raises(CodeAssistError) as exc_info:
+                client.chat.completions.create(
+                    model="antigravity-cascade",
+                    messages=[{"role": "user", "content": "hi"}],
+                    **kwargs,
+                )
+        finally:
+            client.close()
+
+        assert "does not support Hermes tool calls yet" in str(exc_info.value)
+        assert exc_info.value.code == "antigravity_cascade_tools_unsupported"
+
+    @staticmethod
+    def _fake_cascade_client_class(events):
+        """Build a FakeCascadeClient that streams ``events`` (respecting cap)."""
+
+        class FakeCascadeClient:
+            instances = []
+
+            def __init__(self):
+                self.pulled = 0
+                FakeCascadeClient.instances.append(self)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_exc_info):
+                return None
+
+            def start_cascade(self, *, model_enum):
+                self.model_enum = model_enum
+                return SimpleNamespace(cascade_id="fake-cascade-id")
+
+            def send_user_message(self, cascade_id, message):
+                self.message = message
+                return 200
+
+            def stream_agent_state_updates(self, cascade_id, *, max_events):
+                for event in events[:max_events]:
+                    self.pulled += 1
+                    yield event
+
+        return FakeCascadeClient
+
+    def _patch_cascade_client(self, monkeypatch, events):
+        from agent import gemini_cloudcode_adapter
+
+        fake_class = self._fake_cascade_client_class(events)
+        monkeypatch.setattr(
+            gemini_cloudcode_adapter,
+            "AntigravityCascadeClient",
+            fake_class,
+        )
+        return fake_class
+
+    def test_antigravity_cascade_streaming_yields_exact_suffix_chunk_sequence(
+        self,
+        monkeypatch,
+    ):
+        fake_class = self._patch_cascade_client(
+            monkeypatch,
+            [
+                # Cascade re-emits the full text while generating + on done;
+                # the adapter must stream suffix-only deltas.
+                SimpleNamespace(type="assistant_text", text="Hel"),
+                SimpleNamespace(type="assistant_text", text="Hello"),
+                SimpleNamespace(type="assistant_text", text="Hello wor"),
+                # Step-level done must not terminate the stream.
+                SimpleNamespace(type="done", text="CORTEX_STEP_STATUS_DONE"),
+                SimpleNamespace(type="assistant_text", text="Hello world"),
+                # Full re-emission in the done state: no duplicate delta.
+                SimpleNamespace(type="assistant_text", text="Hello world"),
+                SimpleNamespace(type="done", text="", conversation_done=True),
+            ],
+        )
+        from agent.gemini_cloudcode_adapter import GeminiCloudCodeClient
+
+        client = GeminiCloudCodeClient(api_key="dummy")
+        try:
+            chunks = list(
+                client.chat.completions.create(
+                    model="antigravity-cascade",
+                    messages=[{"role": "user", "content": "Say hello world."}],
+                    stream=True,
+                )
+            )
+        finally:
+            client.close()
+
+        assert [chunk.object for chunk in chunks] == ["chat.completion.chunk"] * 6
+        assert all(chunk.id.startswith("chatcmpl-antigravity-") for chunk in chunks)
+        assert all(chunk.model == "antigravity-cascade" for chunk in chunks)
+        assert all(chunk.usage is None for chunk in chunks)
+        assert all(chunk.choices[0].delta.role == "assistant" for chunk in chunks)
+        assert chunks[0].choices[0].delta.content is None
+        assert chunks[0].choices[0].finish_reason is None
+        deltas = [chunk.choices[0].delta.content for chunk in chunks[1:-1]]
+        assert deltas == ["Hel", "lo", " wor", "ld"]
+        assert all(
+            chunk.choices[0].finish_reason is None for chunk in chunks[:-1]
+        )
+        assert chunks[-1].choices[0].delta.content is None
+        assert chunks[-1].choices[0].finish_reason == "stop"
+        assert "".join(deltas) == "Hello world"
+        fake = fake_class.instances[0]
+        assert fake.model_enum == "MODEL_PLACEHOLDER_M132"
+        # Terminated on the conversation-level signal, not on stream close.
+        assert fake.pulled == 7
+
+    def test_antigravity_cascade_stream_breaks_on_conversation_done_only(
+        self,
+        monkeypatch,
+    ):
+        fake_class = self._patch_cascade_client(
+            monkeypatch,
+            [
+                SimpleNamespace(type="done", text="CORTEX_STEP_STATUS_DONE"),
+                SimpleNamespace(type="tool_result", text="", tool_name="list_dir"),
+                SimpleNamespace(type="assistant_text", text="OK"),
+                SimpleNamespace(type="done", text="", conversation_done=True),
+                SimpleNamespace(type="assistant_text", text="MUST_NOT_BE_PULLED"),
+            ],
+        )
+        from agent.gemini_cloudcode_adapter import GeminiCloudCodeClient
+
+        client = GeminiCloudCodeClient(api_key="dummy")
+        try:
+            chunks = list(
+                client.chat.completions.create(
+                    model="antigravity-cascade",
+                    messages=[{"role": "user", "content": "hi"}],
+                    stream=True,
+                )
+            )
+        finally:
+            client.close()
+
+        deltas = [
+            chunk.choices[0].delta.content
+            for chunk in chunks
+            if chunk.choices[0].delta.content
+        ]
+        assert deltas == ["OK"]
+        assert chunks[-1].choices[0].finish_reason == "stop"
+        assert fake_class.instances[0].pulled == 4
+
+    def test_antigravity_cascade_event_cap_exhaustion_maps_to_length(
+        self,
+        monkeypatch,
+    ):
+        from agent import gemini_cloudcode_adapter
+        from agent.gemini_cloudcode_adapter import GeminiCloudCodeClient
+
+        monkeypatch.setattr(
+            gemini_cloudcode_adapter, "_ANTIGRAVITY_CASCADE_MAX_EVENTS", 3
+        )
+        events = [
+            SimpleNamespace(type="assistant_text", text="part"),
+            SimpleNamespace(type="assistant_text", text="part part"),
+            SimpleNamespace(type="assistant_text", text="part part part"),
+            SimpleNamespace(type="assistant_text", text="never reached"),
+        ]
+
+        self._patch_cascade_client(monkeypatch, events)
+        client = GeminiCloudCodeClient(api_key="dummy")
+        try:
+            chunks = list(
+                client.chat.completions.create(
+                    model="antigravity-cascade",
+                    messages=[{"role": "user", "content": "hi"}],
+                    stream=True,
+                )
+            )
+        finally:
+            client.close()
+        assert chunks[-1].choices[0].finish_reason == "length"
+        assert chunks[-1].choices[0].delta.content is None
+
+        self._patch_cascade_client(monkeypatch, events)
+        client = GeminiCloudCodeClient(api_key="dummy")
+        try:
+            resp = client.chat.completions.create(
+                model="antigravity-cascade",
+                messages=[{"role": "user", "content": "hi"}],
+            )
+        finally:
+            client.close()
+        assert resp.choices[0].finish_reason == "length"
+        assert resp.choices[0].message.content == "part part part"
+
+    def test_antigravity_cascade_stream_close_before_cap_is_stop(
+        self,
+        monkeypatch,
+    ):
+        self._patch_cascade_client(
+            monkeypatch,
+            [
+                SimpleNamespace(type="assistant_text", text="OK"),
+                SimpleNamespace(type="done", text="CORTEX_STEP_STATUS_DONE"),
+            ],
+        )
+        from agent.gemini_cloudcode_adapter import GeminiCloudCodeClient
+
+        client = GeminiCloudCodeClient(api_key="dummy")
+        try:
+            chunks = list(
+                client.chat.completions.create(
+                    model="antigravity-cascade",
+                    messages=[{"role": "user", "content": "hi"}],
+                    stream=True,
+                )
+            )
+        finally:
+            client.close()
+
+        assert chunks[-1].choices[0].finish_reason == "stop"
+
+    def test_antigravity_cascade_stream_midstream_error_raises_sanitized(
+        self,
+        monkeypatch,
+    ):
+        from agent.gemini_cloudcode_adapter import GeminiCloudCodeClient
+        from agent.google_code_assist import CodeAssistError
+
+        self._patch_cascade_client(
+            monkeypatch,
+            [
+                SimpleNamespace(type="assistant_text", text="partial"),
+                SimpleNamespace(
+                    type="error",
+                    text="boom csrfToken=csrf-secret",
+                ),
+            ],
+        )
+        client = GeminiCloudCodeClient(api_key="dummy")
+        try:
+            stream = client.chat.completions.create(
+                model="antigravity-cascade",
+                messages=[{"role": "user", "content": "hi"}],
+                stream=True,
+            )
+            received = []
+            with pytest.raises(CodeAssistError) as exc_info:
+                for chunk in stream:
+                    received.append(chunk)
+        finally:
+            client.close()
+
+        # Role chunk + the partial delta arrived before the error surfaced.
+        assert received[0].choices[0].delta.content is None
+        assert received[1].choices[0].delta.content == "partial"
+        assert exc_info.value.code == "antigravity_cascade_error"
+        assert "csrf-secret" not in str(exc_info.value)
+        assert "[REDACTED]" in str(exc_info.value)
+
+    def _patch_truncating_cascade_client(self, monkeypatch, deltas):
+        """Patch a fake whose stream stalls (ReadTimeout) after partial output.
+
+        The cascade client surfaces a mid-generation stall as an
+        AntigravityCascadeError with code ``antigravity_cascade_truncated`` once
+        at least one event has been yielded.
+        """
+        from agent import gemini_cloudcode_adapter
+        from agent.google_antigravity_cascade import AntigravityCascadeError
+
+        class TruncatingCascadeClient:
+            instances = []
+
+            def __init__(self):
+                self.pulled = 0
+                TruncatingCascadeClient.instances.append(self)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_exc_info):
+                return None
+
+            def start_cascade(self, *, model_enum):
+                self.model_enum = model_enum
+                return SimpleNamespace(cascade_id="fake-cascade-id")
+
+            def send_user_message(self, cascade_id, message):
+                return 200
+
+            def stream_agent_state_updates(self, cascade_id, *, max_events):
+                for text in deltas:
+                    self.pulled += 1
+                    yield SimpleNamespace(type="assistant_text", text=text)
+                err = AntigravityCascadeError("timed out mid-generation")
+                err.code = "antigravity_cascade_truncated"
+                raise err
+
+        monkeypatch.setattr(
+            gemini_cloudcode_adapter,
+            "AntigravityCascadeClient",
+            TruncatingCascadeClient,
+        )
+        return TruncatingCascadeClient
+
+    def test_antigravity_cascade_nonstream_midstream_truncation_is_length(
+        self,
+        monkeypatch,
+    ):
+        self._patch_truncating_cascade_client(monkeypatch, ["Partial ", "Partial answer"])
+        from agent.gemini_cloudcode_adapter import GeminiCloudCodeClient
+
+        client = GeminiCloudCodeClient(api_key="dummy")
+        try:
+            resp = client.chat.completions.create(
+                model="antigravity-cascade",
+                messages=[{"role": "user", "content": "hi"}],
+            )
+        finally:
+            client.close()
+
+        # Partial text preserved, but honestly flagged incomplete (not "stop").
+        assert resp.choices[0].message.content == "Partial answer"
+        assert resp.choices[0].finish_reason == "length"
+
+    def test_antigravity_cascade_stream_midstream_truncation_is_length(
+        self,
+        monkeypatch,
+    ):
+        self._patch_truncating_cascade_client(monkeypatch, ["Partial ", "Partial answer"])
+        from agent.gemini_cloudcode_adapter import GeminiCloudCodeClient
+
+        client = GeminiCloudCodeClient(api_key="dummy")
+        try:
+            chunks = list(
+                client.chat.completions.create(
+                    model="antigravity-cascade",
+                    messages=[{"role": "user", "content": "hi"}],
+                    stream=True,
+                )
+            )
+        finally:
+            client.close()
+
+        deltas = [
+            chunk.choices[0].delta.content
+            for chunk in chunks
+            if chunk.choices[0].delta.content
+        ]
+        assert "".join(deltas) == "Partial answer"
+        # Final chunk honestly signals truncation rather than a clean stop.
+        assert chunks[-1].choices[0].finish_reason == "length"
+        assert chunks[-1].choices[0].delta.content is None
+
+    def test_antigravity_cascade_nonstream_terminates_on_conversation_done(
+        self,
+        monkeypatch,
+    ):
+        fake_class = self._patch_cascade_client(
+            monkeypatch,
+            [
+                SimpleNamespace(type="done", text="CORTEX_STEP_STATUS_DONE"),
+                SimpleNamespace(type="assistant_text", text="OK"),
+                SimpleNamespace(type="done", text="", conversation_done=True),
+                SimpleNamespace(type="assistant_text", text="MUST_NOT_BE_PULLED"),
+            ],
+        )
+        from agent.gemini_cloudcode_adapter import GeminiCloudCodeClient
+
+        client = GeminiCloudCodeClient(api_key="dummy")
+        try:
+            resp = client.chat.completions.create(
+                model="antigravity-cascade",
+                messages=[{"role": "user", "content": "hi"}],
+            )
+        finally:
+            client.close()
+
+        assert resp.choices[0].message.content == "OK"
+        assert resp.choices[0].finish_reason == "stop"
+        assert fake_class.instances[0].pulled == 3
+
 
 class TestGeminiHttpErrorParsing:
     """Regression coverage for _gemini_http_error Google-envelope parsing.
@@ -1116,6 +1760,49 @@ class TestProviderRegistration:
 
         assert "google-gemini-cli" in PROVIDER_REGISTRY
         assert PROVIDER_REGISTRY["google-gemini-cli"].auth_type == "oauth_external"
+
+    def test_google_gemini_cli_model_list_includes_antigravity_models(self):
+        from hermes_cli.models import _PROVIDER_MODELS
+
+        models = _PROVIDER_MODELS["google-gemini-cli"]
+        assert "gemini-3.5-flash-high" in models
+        assert "gemini-3.1-pro-high" in models
+        assert "gemini-3.1-flash-lite" in models
+        assert "antigravity-cascade" in models
+
+    def test_google_gemini_cli_curated_ids_do_not_shadow_other_catalogs(self):
+        """Regression guard: cross-vendor Antigravity presets must be
+        namespaced (``antigravity-`` prefix) so the curated picker list never
+        collides with other providers' static catalogs or shadows short
+        aliases such as sonnet/opus/gpt in provider auto-detection."""
+        from agent.gemini_cloudcode_models import GOOGLE_GEMINI_CLI_APP_MODEL_IDS
+        from hermes_cli.models import _PROVIDER_MODELS
+
+        curated = {m.lower() for m in GOOGLE_GEMINI_CLI_APP_MODEL_IDS}
+        for provider, models in _PROVIDER_MODELS.items():
+            if provider == "google-gemini-cli":
+                continue
+            collisions = sorted(curated.intersection({m.lower() for m in models}))
+            assert not collisions, (
+                f"google-gemini-cli curated IDs collide with {provider} "
+                f"catalog: {collisions}"
+            )
+
+    def test_cross_vendor_picker_ids_still_resolve_via_app_slug(self):
+        """Manual spellings of the raw app slugs keep resolving to the
+        Antigravity route even though picker IDs are namespaced."""
+        from agent.gemini_cloudcode_models import (
+            resolve_google_gemini_cli_model_alias,
+        )
+
+        for spelling, expected_enum in (
+            ("antigravity-claude-sonnet-4-6", "MODEL_PLACEHOLDER_M35"),
+            ("claude-sonnet-4-6", "MODEL_PLACEHOLDER_M35"),
+            ("antigravity-gpt-oss-120b-medium", "MODEL_OPENAI_GPT_OSS_120B_MEDIUM"),
+            ("gpt-oss-120b-medium", "MODEL_OPENAI_GPT_OSS_120B_MEDIUM"),
+        ):
+            backend_model, _extra = resolve_google_gemini_cli_model_alias(spelling)
+            assert backend_model == expected_enum, spelling
 
     def test_google_gemini_alias_still_goes_to_api_key_gemini(self):
         """Regression guard: don't shadow the existing google-gemini → gemini alias."""

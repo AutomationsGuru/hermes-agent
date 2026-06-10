@@ -1,0 +1,10 @@
+{
+  "opaque": {
+    "nested": [
+      1,
+      2,
+      3
+    ]
+  },
+  "csrf": "unknown-secret"
+}

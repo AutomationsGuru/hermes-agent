@@ -1,0 +1,20 @@
+{
+  "update": {
+    "mainTrajectoryUpdate": {
+      "stepsUpdate": {
+        "steps": [
+          {
+            "type": "CORTEX_STEP_TYPE_LIST_DIRECTORY",
+            "status": "CORTEX_STEP_STATUS_DONE",
+            "args": {
+              "path": "tests/fixtures/antigravity"
+            },
+            "result": {
+              "text": "cascade_assistant_text.json\ncascade_done.json\ncascade_error.json"
+            }
+          }
+        ]
+      }
+    }
+  }
+}

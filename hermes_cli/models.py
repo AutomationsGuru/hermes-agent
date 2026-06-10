@@ -16,6 +16,7 @@ from difflib import get_close_matches
 from pathlib import Path
 from typing import Any, NamedTuple, Optional
 
+from agent.gemini_cloudcode_models import GOOGLE_GEMINI_CLI_APP_MODEL_IDS
 from hermes_cli import __version__ as _HERMES_VERSION
 
 # Identify ourselves so endpoints fronted by Cloudflare's Browser Integrity
@@ -245,15 +246,18 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         "gemini-3.1-flash-lite-preview",
     ],
     "google-gemini-cli": [
+        *GOOGLE_GEMINI_CLI_APP_MODEL_IDS,
         "gemini-3.1-pro-preview",
         "gemini-3-pro-preview",
-        # Code Assist serves two flash slugs with different access gates
-        # (gemini-cli models.ts): gemini-3-flash-preview is the preview flash
-        # that subscription/free-tier OAuth users actually reach, while
-        # gemini-3.5-flash is GA-channel-gated. Offer both so non-GA users
-        # aren't stuck with a slug cloudcode-pa 404s for them.
+        # Code Assist serves preview flash through direct cloudcode-pa. The
+        # app-visible Antigravity flash presets above map to internal enums.
         "gemini-3-flash-preview",
+        # GA-channel direct cloudcode-pa slug — served by Code Assist without
+        # the local Antigravity app (distinct from the Antigravity
+        # 'gemini-3.5-flash-*' presets above, which require it).
         "gemini-3.5-flash",
+        # Local Antigravity Cascade experimental route.
+        "antigravity-cascade",
     ],
     "zai": [
         "glm-5.1",
@@ -1250,6 +1254,11 @@ _PROVIDER_ALIASES = {
 # hit the Portal; this fallback must stay cheap and network-free.
 _PROVIDER_SILENT_DEFAULT_OVERRIDES: dict[str, str] = {
     "nous": "deepseek/deepseek-v4-flash",
+    # google-gemini-cli's curated list leads with Antigravity app presets,
+    # which only answer while the local Antigravity desktop app is running.
+    # The silent fallback must stay dependency- and network-free, so pin it
+    # to the cloudcode-route default (the pre-Antigravity list head).
+    "google-gemini-cli": "gemini-3.1-pro-preview",
 }
 
 
@@ -1273,6 +1282,129 @@ def get_default_model_for_provider(provider: str) -> str:
     if override and override in models:
         return override
     return models[0] if models else ""
+
+
+# ---------------------------------------------------------------------------
+# google-gemini-cli ↔ local Antigravity availability
+# ---------------------------------------------------------------------------
+#
+# A subset of the google-gemini-cli catalog (the Antigravity app presets from
+# ``GOOGLE_GEMINI_CLI_APP_MODEL_IDS`` plus the experimental
+# ``antigravity-cascade`` ids) routes through the *local* Antigravity language
+# server instead of Google's cloudcode-pa endpoint.  Those entries can only
+# answer while the local app is running, so listing surfaces hide them when it
+# is down and ``/model`` selection reports the actionable hint instead of a
+# stack trace.  The probe is memoized per process with a short TTL so a
+# listing call performs at most one local check — and it never raises.
+
+
+class AntigravityAvailability(NamedTuple):
+    """Token-free availability snapshot of the local Antigravity server."""
+
+    available: bool
+    base_url: str = ""
+    reason: str = ""
+
+
+_ANTIGRAVITY_UNAVAILABLE_HINT = (
+    "Start Antigravity or set HERMES_ANTIGRAVITY_URL."
+)
+_ANTIGRAVITY_STATUS_TTL = 30.0  # seconds — keeps repeat listings probe-free
+_antigravity_status_cache: Optional[tuple[float, AntigravityAvailability]] = None
+
+
+def google_gemini_cli_antigravity_status(
+    *, force_refresh: bool = False
+) -> AntigravityAvailability:
+    """Return the local Antigravity bridge status.  Never raises.
+
+    Memoized per process for ``_ANTIGRAVITY_STATUS_TTL`` seconds so model
+    listing/validation does at most one local probe per call burst.  Pass
+    ``force_refresh=True`` (``/model --refresh``) to bypass the memo.
+    """
+    global _antigravity_status_cache
+    cached = _antigravity_status_cache
+    now = time.monotonic()
+    if (
+        not force_refresh
+        and cached is not None
+        and (now - cached[0]) < _ANTIGRAVITY_STATUS_TTL
+    ):
+        return cached[1]
+    try:
+        from agent.google_antigravity_bridge import check_antigravity_available
+
+        raw = check_antigravity_available()
+        status = AntigravityAvailability(
+            available=bool(getattr(raw, "available", False)),
+            base_url=str(getattr(raw, "base_url", "") or ""),
+            reason=str(getattr(raw, "reason", "") or ""),
+        )
+    except Exception:
+        # check_antigravity_available() is documented never to raise; this
+        # guard also covers import failures so listing surfaces cannot crash.
+        status = AntigravityAvailability(
+            available=False,
+            reason=f"Antigravity bridge unavailable. {_ANTIGRAVITY_UNAVAILABLE_HINT}",
+        )
+    _antigravity_status_cache = (time.monotonic(), status)
+    return status
+
+
+def _google_gemini_cli_model_requires_antigravity(model_id: str) -> bool:
+    """True when a google-gemini-cli model id needs the local Antigravity app.
+
+    Wires the ``requires_local_antigravity`` capability flag from the picker
+    alias catalog (``agent.gemini_cloudcode_models``).  The experimental
+    ``antigravity-cascade`` ids resolve through the adapter's own alias table
+    rather than the catalog, so they are checked separately.
+    """
+    name = str(model_id or "").strip()
+    if not name:
+        return False
+    try:
+        from agent.gemini_cloudcode_models import (
+            google_gemini_cli_model_capabilities,
+        )
+
+        if bool(
+            google_gemini_cli_model_capabilities(name).get(
+                "requires_local_antigravity"
+            )
+        ):
+            return True
+    except Exception:
+        pass
+    # Only the antigravity-cascade* ids remain; gate on the prefix so pure
+    # cloudcode lists never pay the adapter import.
+    lowered = name.lower()
+    if not lowered.startswith("antigravity-"):
+        return False
+    try:
+        from agent.gemini_cloudcode_adapter import is_antigravity_cascade_model
+
+        return is_antigravity_cascade_model(name)
+    except Exception:
+        return lowered.startswith("antigravity-cascade")
+
+
+def filter_unavailable_google_gemini_cli_models(
+    model_ids: Optional[list[str]],
+    *,
+    force_refresh: bool = False,
+) -> list[str]:
+    """Hide antigravity-route ids while the local server is unreachable.
+
+    Cloudcode-route models always pass through untouched and keep their
+    order.  At most one availability probe per call (skipped entirely when
+    the list carries no antigravity-route entries); never raises.
+    """
+    ids = [str(m) for m in (model_ids or [])]
+    if not any(_google_gemini_cli_model_requires_antigravity(m) for m in ids):
+        return ids
+    if google_gemini_cli_antigravity_status(force_refresh=force_refresh).available:
+        return ids
+    return [m for m in ids if not _google_gemini_cli_model_requires_antigravity(m)]
 
 
 def _openrouter_model_is_free(pricing: Any) -> bool:
@@ -2177,6 +2309,16 @@ def provider_model_ids(provider: Optional[str], *, force_refresh: bool = False) 
         return get_codex_model_ids(access_token=access_token)
     if normalized == "xai-oauth":
         return list(_PROVIDER_MODELS.get("xai-oauth", _PROVIDER_MODELS.get("xai", [])))
+    if normalized == "google-gemini-cli":
+        # Static curated catalog + honest availability: antigravity-route
+        # entries are hidden while the local Antigravity language server is
+        # unreachable, so the picker never offers models that cannot answer.
+        # Cloudcode-route models are never touched. The probe is local-only,
+        # process-memoized, and never raises.
+        return filter_unavailable_google_gemini_cli_models(
+            _PROVIDER_MODELS.get("google-gemini-cli", []),
+            force_refresh=force_refresh,
+        )
     if normalized in {"copilot", "copilot-acp"}:
         try:
             live = _fetch_github_models(_resolve_copilot_catalog_api_key())
@@ -2467,6 +2609,13 @@ def cached_provider_model_ids(
     normalized = normalize_provider(provider) or (provider or "")
     if not normalized:
         return []
+
+    # google-gemini-cli is a static catalog plus a *local* Antigravity
+    # availability filter — there is no slow remote fetch worth caching, and
+    # disk-caching the filtered list would pin an availability snapshot for
+    # up to an hour after the local app starts or stops. Always compute live.
+    if normalized == "google-gemini-cli":
+        return provider_model_ids(normalized, force_refresh=force_refresh)
 
     cache = _load_provider_models_cache()
     fp = _credential_fingerprint(normalized)
@@ -3548,6 +3697,33 @@ def validate_requested_model(
             "persist": False,
             "recognized": False,
             "message": "Model names cannot contain spaces.",
+        }
+
+    # google-gemini-cli: antigravity-route entries (the app presets and the
+    # experimental cascade ids) depend on the *local* Antigravity language
+    # server, not on a remote /models endpoint.  Validate them against the
+    # capability metadata and report availability honestly: selecting one
+    # while the server is down yields the actionable hint (never a stack
+    # trace) but still persists — the model works as soon as the app is up.
+    # Cloudcode-route models fall through to the normal probing logic.
+    if normalized == "google-gemini-cli" and _google_gemini_cli_model_requires_antigravity(
+        requested_for_lookup
+    ):
+        if google_gemini_cli_antigravity_status().available:
+            return {
+                "accepted": True,
+                "persist": True,
+                "recognized": True,
+                "message": None,
+            }
+        return {
+            "accepted": True,
+            "persist": True,
+            "recognized": True,
+            "message": (
+                f"Note: `{requested}` runs on the local Antigravity app, which "
+                f"is not reachable right now. {_ANTIGRAVITY_UNAVAILABLE_HINT}"
+            ),
         }
 
     if normalized == "lmstudio":

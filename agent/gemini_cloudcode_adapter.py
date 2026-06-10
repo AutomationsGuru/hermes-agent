@@ -38,6 +38,12 @@ from typing import Any, Dict, Iterator, List, Optional
 import httpx
 
 from agent import google_oauth
+from agent.gemini_cloudcode_models import (
+    GOOGLE_GEMINI_CLI_ROUTE_ANTIGRAVITY,
+    google_gemini_cli_route_from_extra_body,
+    resolve_google_gemini_cli_model_alias,
+    strip_google_gemini_cli_route_hint,
+)
 from agent.gemini_schema import sanitize_gemini_tool_parameters
 from agent.google_code_assist import (
     CODE_ASSIST_ENDPOINT,
@@ -45,8 +51,36 @@ from agent.google_code_assist import (
     ProjectContext,
     resolve_project_context,
 )
+from agent.google_antigravity_cascade import (
+    AntigravityCascadeClient,
+    AntigravityCascadeError,
+    sanitize_console_text,
+)
 
 logger = logging.getLogger(__name__)
+
+ANTIGRAVITY_CASCADE_MODEL_ALIASES = {
+    "antigravity-cascade": "MODEL_PLACEHOLDER_M132",
+    "antigravity-cascade-m132": "MODEL_PLACEHOLDER_M132",
+    "MODEL_PLACEHOLDER_M132": "MODEL_PLACEHOLDER_M132",
+}
+# Safety valve, not the normal terminator: the adapter now breaks on the
+# conversation-level CASCADE_RUN_STATUS_IDLE signal, so the cap only guards
+# against a runaway stream.  Exhausting it maps to finish_reason="length".
+_ANTIGRAVITY_CASCADE_MAX_EVENTS = 1000
+
+
+def resolve_antigravity_cascade_model_enum(model: str) -> Optional[str]:
+    """Return the Antigravity Cascade model enum for a public model alias."""
+
+    name = str(model or "").strip()
+    return ANTIGRAVITY_CASCADE_MODEL_ALIASES.get(name)
+
+
+def is_antigravity_cascade_model(model: str) -> bool:
+    """Return whether ``model`` should use the local Antigravity Cascade route."""
+
+    return resolve_antigravity_cascade_model_enum(model) is not None
 
 
 # =============================================================================
@@ -81,6 +115,213 @@ def _coerce_content_to_text(content: Any) -> str:
                     logger.debug("Dropping multimodal part (not yet supported): %s", p.get("type"))
         return "\n".join(pieces)
     return str(content)
+
+
+def _coerce_content_to_antigravity_text(content: Any) -> str:
+    """Flatten OpenAI content into text for the no-tool Cascade prompt."""
+
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        pieces: List[str] = []
+        for part in content:
+            if isinstance(part, str):
+                pieces.append(part)
+                continue
+            if not isinstance(part, dict):
+                pieces.append(str(part))
+                continue
+            part_type = str(part.get("type") or "").strip()
+            text = part.get("text")
+            if isinstance(text, str) and (part_type in {"", "text", "input_text"}):
+                pieces.append(text)
+                continue
+            label = part_type or "unknown"
+            pieces.append(f"[non-text {label} part omitted]")
+        return "\n".join(piece for piece in pieces if piece)
+    return str(content)
+
+
+def _build_antigravity_cascade_prompt(messages: List[Dict[str, Any]]) -> str:
+    """Convert OpenAI-style messages to a deterministic labelled prompt."""
+
+    lines: List[str] = []
+    role_labels = {
+        "system": "System",
+        "developer": "Developer",
+        "user": "User",
+        "assistant": "Assistant",
+        "tool": "Tool",
+        "function": "Tool",
+    }
+    for message in messages or []:
+        if not isinstance(message, dict):
+            continue
+        role = str(message.get("role") or "user").strip().lower()
+        label = role_labels.get(role, role.title() if role else "User")
+        content = _coerce_content_to_antigravity_text(message.get("content"))
+        if content:
+            lines.append(f"{label}: {content}")
+        if role == "assistant" and message.get("tool_calls"):
+            lines.append("Assistant: [tool calls omitted]")
+    return "\n\n".join(lines).strip()
+
+
+def _tool_choice_forces_tools(tool_choice: Any) -> bool:
+    if tool_choice is None:
+        return False
+    if isinstance(tool_choice, str):
+        return tool_choice not in {"auto", "none"}
+    if isinstance(tool_choice, dict):
+        return bool(tool_choice.get("function"))
+    return True
+
+
+def _merge_antigravity_assistant_text(current: str, new_text: str) -> str:
+    text = str(new_text or "")
+    if not text:
+        return current
+    if not current:
+        return text
+    if text == current or current.startswith(text):
+        return current
+    if text.startswith(current):
+        return text
+    return f"{current}{text}"
+
+
+def _iter_antigravity_cascade_deltas(
+    *,
+    model_enum: str,
+    prompt: str,
+) -> Iterator[tuple[str, str]]:
+    """Yield ``("delta", suffix)`` tuples, then one final ``("finish", reason)``.
+
+    Runs the StartCascade -> SendUserCascadeMessage -> StreamAgentStateUpdates
+    sequence and translates the parsed events:
+
+    - ``assistant_text`` events re-emit the full text while generating, so the
+      merged text is tracked (same rules as ``_merge_antigravity_assistant_text``)
+      and only the new suffix is yielded — never duplicated text.
+    - Per-step ``done``/``tool_result`` events never terminate; only the
+      conversation-level signal (``conversation_done=True``) does, mapping to
+      finish_reason ``"stop"``.
+    - Exhausting the event cap mid-generation maps to finish_reason ``"length"``.
+    - ``error`` events and transport failures raise sanitized ``CodeAssistError``.
+    """
+
+    merged_text = ""
+    conversation_done = False
+    events_seen = 0
+    try:
+        with AntigravityCascadeClient() as cascade_client:
+            session = cascade_client.start_cascade(model_enum=model_enum)
+            cascade_client.send_user_message(session.cascade_id, prompt)
+            for event in cascade_client.stream_agent_state_updates(
+                session.cascade_id,
+                max_events=_ANTIGRAVITY_CASCADE_MAX_EVENTS,
+            ):
+                events_seen += 1
+                event_type = getattr(event, "type", "")
+                if event_type == "assistant_text":
+                    merged = _merge_antigravity_assistant_text(
+                        merged_text,
+                        getattr(event, "text", ""),
+                    )
+                    if len(merged) > len(merged_text):
+                        suffix = merged[len(merged_text):]
+                        merged_text = merged
+                        yield ("delta", suffix)
+                elif event_type == "error":
+                    error_text = sanitize_console_text(
+                        getattr(event, "text", "") or "unknown error"
+                    )
+                    raise CodeAssistError(
+                        f"Antigravity Cascade error: {error_text}",
+                        code="antigravity_cascade_error",
+                    )
+                elif event_type == "done" and getattr(
+                    event, "conversation_done", False
+                ):
+                    conversation_done = True
+                    break
+    except AntigravityCascadeError as exc:
+        if getattr(exc, "code", "") == "antigravity_cascade_truncated" and events_seen:
+            # A mid-generation stall after partial output: keep what we received
+            # but report finish_reason="length" so the reply is honestly flagged
+            # incomplete rather than as a clean "stop".
+            yield ("finish", "length")
+            return
+        error_text = sanitize_console_text(exc)
+        raise CodeAssistError(
+            f"Antigravity Cascade request failed: {error_text}",
+            code=getattr(exc, "code", "antigravity_cascade_error"),
+            status_code=getattr(exc, "status_code", None),
+        ) from exc
+
+    if not conversation_done and events_seen >= _ANTIGRAVITY_CASCADE_MAX_EVENTS:
+        yield ("finish", "length")
+    else:
+        yield ("finish", "stop")
+
+
+def _make_antigravity_stream_chunk(
+    *,
+    model: str,
+    content: Optional[str] = None,
+    finish_reason: Optional[str] = None,
+) -> _GeminiStreamChunk:
+    """OpenAI-style chat.completion.chunk for the Antigravity Cascade route."""
+
+    delta = SimpleNamespace(
+        role="assistant",
+        content=content,
+        tool_calls=None,
+        reasoning=None,
+        reasoning_content=None,
+    )
+    choice = SimpleNamespace(index=0, delta=delta, finish_reason=finish_reason)
+    return _GeminiStreamChunk(
+        id=f"chatcmpl-antigravity-{uuid.uuid4().hex[:12]}",
+        object="chat.completion.chunk",
+        created=int(time.time()),
+        model=model,
+        choices=[choice],
+        usage=None,
+    )
+
+
+def _make_antigravity_text_response(
+    *,
+    model: str,
+    content: str,
+    finish_reason: str = "stop",
+) -> SimpleNamespace:
+    usage = SimpleNamespace(
+        prompt_tokens=0,
+        completion_tokens=0,
+        total_tokens=0,
+        prompt_tokens_details=SimpleNamespace(cached_tokens=0),
+    )
+    message = SimpleNamespace(
+        role="assistant",
+        content=str(content or ""),
+        tool_calls=None,
+        reasoning=None,
+        reasoning_content=None,
+        reasoning_details=None,
+    )
+    choice = SimpleNamespace(index=0, message=message, finish_reason=finish_reason)
+    return SimpleNamespace(
+        id=f"chatcmpl-antigravity-{uuid.uuid4().hex[:12]}",
+        object="chat.completion",
+        created=int(time.time()),
+        model=model,
+        choices=[choice],
+        usage=usage,
+    )
 
 
 def _translate_tool_call_to_gemini(tool_call: Dict[str, Any]) -> Dict[str, Any]:
@@ -678,6 +919,24 @@ class GeminiCloudCodeClient:
         timeout: Any = None,
         **_: Any,
     ) -> Any:
+        selected_model = model
+        model, extra_body = resolve_google_gemini_cli_model_alias(model, extra_body)
+        route = google_gemini_cli_route_from_extra_body(extra_body)
+        extra_body = strip_google_gemini_cli_route_hint(extra_body)
+
+        antigravity_model_enum = resolve_antigravity_cascade_model_enum(model)
+        if route == GOOGLE_GEMINI_CLI_ROUTE_ANTIGRAVITY:
+            antigravity_model_enum = model
+        if antigravity_model_enum is not None:
+            return self._create_antigravity_cascade_completion(
+                model=selected_model,
+                model_enum=antigravity_model_enum,
+                messages=messages or [],
+                stream=stream,
+                tools=tools,
+                tool_choice=tool_choice,
+            )
+
         access_token = google_oauth.get_valid_access_token()
         ctx = self._ensure_project_context(access_token, model)
 
@@ -712,7 +971,7 @@ class GeminiCloudCodeClient:
         headers.update(self._default_headers)
 
         if stream:
-            return self._stream_completion(model=model, wrapped=wrapped, headers=headers)
+            return self._stream_completion(model=selected_model, wrapped=wrapped, headers=headers)
 
         url = f"{CODE_ASSIST_ENDPOINT}/v1internal:generateContent"
         response = self._http.post(url, json=wrapped, headers=headers)
@@ -725,7 +984,90 @@ class GeminiCloudCodeClient:
                 f"Invalid JSON from Code Assist: {exc}",
                 code="code_assist_invalid_json",
             ) from exc
-        return _translate_gemini_response(payload, model=model)
+        return _translate_gemini_response(payload, model=selected_model)
+
+    def _create_antigravity_cascade_completion(
+        self,
+        *,
+        model: str,
+        model_enum: str,
+        messages: List[Dict[str, Any]],
+        stream: bool,
+        tools: Any,
+        tool_choice: Any,
+    ) -> Any:
+        """Route a no-tool chat completion through local Antigravity Cascade."""
+
+        if tools:
+            raise CodeAssistError(
+                "Antigravity Cascade provider route does not support Hermes tool calls yet",
+                code="antigravity_cascade_tools_unsupported",
+            )
+        if _tool_choice_forces_tools(tool_choice):
+            raise CodeAssistError(
+                "Antigravity Cascade provider route does not support Hermes tool calls yet",
+                code="antigravity_cascade_tools_unsupported",
+            )
+
+        prompt = _build_antigravity_cascade_prompt(messages)
+
+        if stream:
+            return self._stream_antigravity_cascade_completion(
+                model=model,
+                model_enum=model_enum,
+                prompt=prompt,
+            )
+
+        assistant_text = ""
+        finish_reason = "stop"
+        for kind, value in _iter_antigravity_cascade_deltas(
+            model_enum=model_enum,
+            prompt=prompt,
+        ):
+            if kind == "delta":
+                assistant_text += value
+            elif kind == "finish":
+                finish_reason = value
+
+        return _make_antigravity_text_response(
+            model=model,
+            content=assistant_text,
+            finish_reason=finish_reason,
+        )
+
+    def _stream_antigravity_cascade_completion(
+        self,
+        *,
+        model: str,
+        model_enum: str,
+        prompt: str,
+    ) -> Iterator[_GeminiStreamChunk]:
+        """Yield OpenAI-style chunks for the Antigravity Cascade route.
+
+        First chunk carries ``role="assistant"``, subsequent chunks carry
+        suffix-only text deltas (Cascade re-emits full text in generating and
+        done states), and the final chunk carries ``finish_reason`` with no
+        content.  Mid-stream Cascade errors raise sanitized ``CodeAssistError``
+        from the generator.
+        """
+
+        def _generator() -> Iterator[_GeminiStreamChunk]:
+            yield _make_antigravity_stream_chunk(model=model)
+            finish_reason = "stop"
+            for kind, value in _iter_antigravity_cascade_deltas(
+                model_enum=model_enum,
+                prompt=prompt,
+            ):
+                if kind == "delta" and value:
+                    yield _make_antigravity_stream_chunk(model=model, content=value)
+                elif kind == "finish":
+                    finish_reason = value
+            yield _make_antigravity_stream_chunk(
+                model=model,
+                finish_reason=finish_reason,
+            )
+
+        return _generator()
 
     def _stream_completion(
         self,

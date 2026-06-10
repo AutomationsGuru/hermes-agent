@@ -594,7 +594,10 @@ def _model_flow_google_gemini_cli(_config, current_model=""):
         _save_model_choice,
         _update_config_for_provider,
     )
-    from hermes_cli.models import _PROVIDER_MODELS
+    from hermes_cli.models import (
+        _PROVIDER_MODELS,
+        filter_unavailable_google_gemini_cli_models,
+    )
 
     print()
     print("⚠  Google considers using the Gemini CLI OAuth client with third-party")
@@ -636,7 +639,12 @@ def _model_flow_google_gemini_cli(_config, current_model=""):
         print(f"Failed to resolve Gemini credentials: {exc}")
         return
 
-    models = list(_PROVIDER_MODELS.get("google-gemini-cli") or [])
+    # Hide Antigravity-route models when the local server is down so this picker
+    # matches the gateway/model picker (which filter via provider_model_ids);
+    # cloudcode models are unaffected, and the filter never raises.
+    models = filter_unavailable_google_gemini_cli_models(
+        list(_PROVIDER_MODELS.get("google-gemini-cli") or [])
+    )
     default = current_model or (models[0] if models else "gemini-3-flash-preview")
     selected = _prompt_model_selection(models, current_model=default)
     if selected:

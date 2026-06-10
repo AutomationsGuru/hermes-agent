@@ -1,0 +1,12 @@
+{
+  "events": [
+    {
+      "eventType": "agent_failure",
+      "error": {
+        "message": "failed with token",
+        "csrfToken": "csrf-secret",
+        "Authorization": "Bearer bearer-secret"
+      }
+    }
+  ]
+}
