@@ -8002,15 +8002,16 @@ def _(rid, params: dict) -> dict:
         )
         # picker_hints + canonical_order produce the TUI's required shape:
         # `authenticated`/`auth_type`/`key_env`/`warning` per row, in
-        # CANONICAL_PROVIDERS declaration order. include_unconfigured=True
-        # so the picker can show the full provider universe (with the
-        # setup-hint warning attached) instead of only authed rows.
+        # CANONICAL_PROVIDERS declaration order. The Agent OS picker is
+        # usage-focused, so it only lists authenticated/configured providers
+        # after approved-roster filtering; setup/unconfigured provider
+        # discovery belongs in explicit auth/setup flows.
         # Curated model lists are preserved — list_authenticated_providers
         # populates `models` from the curated catalog, not provider_model_ids
         # (which would pull non-agentic models like TTS/embeddings/etc.).
         payload = build_models_payload(
             ctx,
-            include_unconfigured=True,
+            include_unconfigured=False,
             picker_hints=True,
             canonical_order=True,
             pricing=True,

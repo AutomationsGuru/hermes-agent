@@ -209,6 +209,15 @@ def _apply_capabilities(rows: list[dict]) -> None:
                 "fast": bool(model_supports_fast_mode(model)),
                 "reasoning": reasoning,
             }
+            if slug == "google-gemini-cli":
+                try:
+                    from agent.gemini_cloudcode_models import (
+                        google_gemini_cli_model_capabilities,
+                    )
+
+                    caps[model].update(google_gemini_cli_model_capabilities(model))
+                except Exception:
+                    pass
 
         row["capabilities"] = caps
 
@@ -219,24 +228,25 @@ def _apply_capabilities(rows: list[dict]) -> None:
 def _append_unconfigured_rows(rows: list[dict], ctx: ConfigContext) -> list[dict]:
     """Build skeleton rows for canonical providers missing from ``rows``."""
     from hermes_cli.models import CANONICAL_PROVIDERS, _PROVIDER_LABELS
+    from hermes_cli.model_governance import is_picker_provider_approved
 
     seen = {r["slug"].lower() for r in rows}
     cur = (ctx.current_provider or "").lower()
     extras: list[dict] = []
     for entry in CANONICAL_PROVIDERS:
+        if not is_picker_provider_approved(entry.slug):
+            continue
         if entry.slug.lower() in seen:
             continue
-        extras.append(
-            {
-                "slug": entry.slug,
-                "name": _PROVIDER_LABELS.get(entry.slug, entry.label),
-                "is_current": entry.slug.lower() == cur,
-                "is_user_defined": False,
-                "models": [],
-                "total_models": 0,
-                "source": "canonical",
-            }
-        )
+        extras.append({
+            "slug": entry.slug,
+            "name": _PROVIDER_LABELS.get(entry.slug, entry.label),
+            "is_current": entry.slug.lower() == cur,
+            "is_user_defined": False,
+            "models": [],
+            "total_models": 0,
+            "source": "canonical",
+        })
     return extras
 
 
@@ -264,11 +274,7 @@ def _apply_picker_hints(rows: list[dict]) -> None:
             continue
         cfg = PROVIDER_REGISTRY.get(row["slug"])
         auth_type = cfg.auth_type if cfg else "api_key"
-        key_env = (
-            cfg.api_key_env_vars[0]
-            if (cfg and cfg.api_key_env_vars)
-            else ""
-        )
+        key_env = cfg.api_key_env_vars[0] if (cfg and cfg.api_key_env_vars) else ""
         row["auth_type"] = auth_type
         row["key_env"] = key_env
         row["warning"] = (
