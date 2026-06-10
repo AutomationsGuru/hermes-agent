@@ -1,6 +1,9 @@
 """Tests for hermes_cli configuration management."""
 
 import os
+import subprocess
+import sys
+import time
 from pathlib import Path
 from unittest.mock import patch
 
@@ -21,6 +24,7 @@ from hermes_cli.config import (
     save_env_value,
     save_env_value_secure,
     sanitize_env_file,
+    config_store_lock,
     _sanitize_env_lines,
 )
 
@@ -393,6 +397,64 @@ class TestSaveConfigAtomicity:
                 raw = yaml.safe_load(f)
             assert raw["model"] == "test/atomic-model"
             assert raw["agent"]["max_turns"] == 77
+
+
+class TestConfigStoreLock:
+    def test_reentrant_lock_uses_config_yaml_lock_path(self, tmp_path):
+        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+            with config_store_lock():
+                with config_store_lock():
+                    pass
+
+            assert (tmp_path / "config.yaml.lock").exists()
+
+    def test_lock_serializes_subprocesses(self, tmp_path):
+        repo_root = Path(__file__).resolve().parents[2]
+        marker = tmp_path / "held.txt"
+        env = {**os.environ, "HERMES_HOME": str(tmp_path)}
+        holder_script = f"""
+import time
+from pathlib import Path
+from hermes_cli.config import config_store_lock
+with config_store_lock():
+    Path({str(marker)!r}).write_text("held", encoding="utf-8")
+    time.sleep(1.0)
+"""
+        probe_script = """
+import time
+from hermes_cli.config import config_store_lock
+start = time.monotonic()
+with config_store_lock(timeout_seconds=5.0):
+    elapsed = time.monotonic() - start
+print(f"{elapsed:.3f}")
+"""
+        holder = subprocess.Popen(
+            [sys.executable, "-c", holder_script],
+            cwd=repo_root,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            deadline = time.monotonic() + 5.0
+            while not marker.exists() and time.monotonic() < deadline:
+                time.sleep(0.05)
+            assert marker.exists(), "holder process never acquired the config lock"
+
+            result = subprocess.run(
+                [sys.executable, "-c", probe_script],
+                cwd=repo_root,
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            assert result.returncode == 0, result.stderr
+            assert float(result.stdout.strip()) >= 0.5
+        finally:
+            stdout, stderr = holder.communicate(timeout=10)
+            assert holder.returncode == 0, stderr or stdout
 
 
 class TestSanitizeEnvLines:

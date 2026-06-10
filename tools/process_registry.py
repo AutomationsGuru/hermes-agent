@@ -47,6 +47,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 from hermes_cli.config import get_hermes_home
+from utils import atomic_json_write, cross_process_file_lock
 
 logger = logging.getLogger(__name__)
 
@@ -156,6 +157,7 @@ class ProcessRegistry:
         self._running: Dict[str, ProcessSession] = {}
         self._finished: Dict[str, ProcessSession] = {}
         self._lock = threading.Lock()
+        self._registry_id = f"{os.getpid()}:{uuid.uuid4().hex}"
 
         # Side-channel for check_interval watchers (gateway reads after agent run)
         self.pending_watchers: List[Dict[str, Any]] = []
@@ -1376,36 +1378,75 @@ class ProcessRegistry:
 
     # ----- Checkpoint (crash recovery) -----
 
-    def _write_checkpoint(self):
-        """Write running process metadata to checkpoint file atomically."""
+    def _checkpoint_lock_path(self):
+        return CHECKPOINT_PATH.with_name(CHECKPOINT_PATH.name + ".lock")
+
+    def _checkpoint_entry_for_session(self, session: ProcessSession) -> Dict[str, Any]:
+        return {
+            "session_id": session.id,
+            "registry_id": self._registry_id,
+            "command": session.command,
+            "pid": session.pid,
+            "pid_scope": session.pid_scope,
+            "cwd": session.cwd,
+            "started_at": session.started_at,
+            "task_id": session.task_id,
+            "session_key": session.session_key,
+            "watcher_platform": session.watcher_platform,
+            "watcher_chat_id": session.watcher_chat_id,
+            "watcher_user_id": session.watcher_user_id,
+            "watcher_user_name": session.watcher_user_name,
+            "watcher_thread_id": session.watcher_thread_id,
+            "watcher_message_id": session.watcher_message_id,
+            "watcher_interval": session.watcher_interval,
+            "notify_on_complete": session.notify_on_complete,
+            "watch_patterns": session.watch_patterns,
+        }
+
+    def _read_checkpoint_entries_unlocked(self) -> List[Dict[str, Any]]:
+        if not CHECKPOINT_PATH.exists():
+            return []
+        try:
+            raw = json.loads(CHECKPOINT_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            return []
+        if not isinstance(raw, list):
+            return []
+        return [entry for entry in raw if isinstance(entry, dict)]
+
+    def _write_checkpoint(self, *, preserve_unknown: bool = True):
+        """Write running process metadata to checkpoint file atomically.
+
+        Multiple Hermes processes can have independent background-process
+        registries. Preserve sibling registries' checkpoint entries instead of
+        replacing the whole file with this process's local snapshot.
+        """
         try:
             with self._lock:
-                entries = []
-                for s in self._running.values():
-                    if not s.exited:
-                        entries.append({
-                            "session_id": s.id,
-                            "command": s.command,
-                            "pid": s.pid,
-                            "pid_scope": s.pid_scope,
-                            "cwd": s.cwd,
-                            "started_at": s.started_at,
-                            "task_id": s.task_id,
-                            "session_key": s.session_key,
-                            "watcher_platform": s.watcher_platform,
-                            "watcher_chat_id": s.watcher_chat_id,
-                            "watcher_user_id": s.watcher_user_id,
-                            "watcher_user_name": s.watcher_user_name,
-                            "watcher_thread_id": s.watcher_thread_id,
-                            "watcher_message_id": s.watcher_message_id,
-                            "watcher_interval": s.watcher_interval,
-                            "notify_on_complete": s.notify_on_complete,
-                            "watch_patterns": s.watch_patterns,
-                        })
-            
-            # Atomic write to avoid corruption on crash
-            from utils import atomic_json_write
-            atomic_json_write(CHECKPOINT_PATH, entries)
+                entries = [
+                    self._checkpoint_entry_for_session(s)
+                    for s in self._running.values()
+                    if not s.exited
+                ]
+
+            current_ids = {entry.get("session_id") for entry in entries}
+            merged: List[Dict[str, Any]] = []
+            with cross_process_file_lock(
+                self._checkpoint_lock_path(),
+                timeout_message=f"Timed out waiting for process checkpoint lock: {self._checkpoint_lock_path()}",
+            ):
+                for entry in self._read_checkpoint_entries_unlocked():
+                    session_id = entry.get("session_id")
+                    registry_id = entry.get("registry_id")
+                    if session_id in current_ids:
+                        continue
+                    if registry_id == self._registry_id:
+                        continue
+                    if registry_id is None and not preserve_unknown:
+                        continue
+                    merged.append(entry)
+                merged.extend(entries)
+                atomic_json_write(CHECKPOINT_PATH, merged)
         except Exception as e:
             logger.debug("Failed to write checkpoint file: %s", e, exc_info=True)
 
@@ -1415,19 +1456,27 @@ class ProcessRegistry:
 
         Returns the number of processes recovered as detached.
         """
-        if not CHECKPOINT_PATH.exists():
-            return 0
-
-        try:
-            entries = json.loads(CHECKPOINT_PATH.read_text(encoding="utf-8"))
-        except Exception:
-            return 0
-
         recovered = 0
-        for entry in entries:
+        with cross_process_file_lock(
+            self._checkpoint_lock_path(),
+            timeout_message=f"Timed out waiting for process checkpoint lock: {self._checkpoint_lock_path()}",
+        ):
+            entries = self._read_checkpoint_entries_unlocked()
+            if not entries:
+                return 0
+
+            for entry in entries:
+                recovered += self._recover_checkpoint_entry(entry)
+
+            self._write_checkpoint(preserve_unknown=False)
+
+        return recovered
+
+    def _recover_checkpoint_entry(self, entry: Dict[str, Any]) -> int:
+        try:
             pid = entry.get("pid")
             if not pid:
-                continue
+                return 0
 
             pid_scope = entry.get("pid_scope", "host")
             if pid_scope != "host":
@@ -1440,7 +1489,7 @@ class ProcessRegistry:
                     pid,
                     pid_scope,
                 )
-                continue
+                return 0
 
             # Check if PID is still alive
             alive = self._is_host_pid_alive(pid)
@@ -1468,7 +1517,6 @@ class ProcessRegistry:
                 )
                 with self._lock:
                     self._running[session.id] = session
-                recovered += 1
                 logger.info("Recovered detached process: %s (pid=%d)", session.command[:60], pid)
 
                 # Re-enqueue watcher so gateway can resume notifications
@@ -1485,10 +1533,10 @@ class ProcessRegistry:
                         "message_id": session.watcher_message_id,
                         "notify_on_complete": session.notify_on_complete,
                     })
-
-        self._write_checkpoint()
-
-        return recovered
+                return 1
+        except Exception as e:
+            logger.debug("Failed to recover checkpoint entry: %s", e, exc_info=True)
+        return 0
 
 
 # Module-level singleton

@@ -1546,8 +1546,31 @@ class AIAgent:
             # Retry row creation if the earlier attempt failed transiently.
             if not self._session_db_created:
                 self._ensure_db_session()
-            start_idx = len(conversation_history) if conversation_history else 0
-            flush_from = max(start_idx, self._last_flushed_db_idx)
+            # Scope the flush cursor by session id. Compression (and /branch)
+            # rotate ``self.session_id`` onto a fresh DB row; any
+            # ``conversation_history`` still floating around belongs to the
+            # PREVIOUS session row. Before this guard, a stale pre-compression
+            # history longer than the compressed message list suppressed every
+            # write to the new continuation session — producing rows with
+            # api_call/token counters but zero messages (see #15000 and
+            # plans/session-stability-improvement-2026-06-10.md).
+            prior_sid = getattr(self, "_last_flushed_session_id", None)
+            rotated = getattr(self, "_session_rotated_since_flush", False) or (
+                prior_sid is not None and prior_sid != self.session_id
+            )
+            if prior_sid == self.session_id or rotated:
+                # Cursor is authoritative: either we've already flushed this
+                # session (the history prefix is accounted for), or the id
+                # rotated and conversation_history must be ignored. Rotation
+                # paths position the cursor themselves (compression resets it
+                # to 0; /branch sets it to the copied-history length).
+                flush_from = self._last_flushed_db_idx
+            else:
+                # First flush for this session in this agent instance
+                # (fresh/resumed agent): skip the already-persisted history
+                # prefix so resume doesn't duplicate rows.
+                start_idx = len(conversation_history) if conversation_history else 0
+                flush_from = max(start_idx, self._last_flushed_db_idx)
             for msg in messages[flush_from:]:
                 role = msg.get("role", "unknown")
                 content = msg.get("content")
@@ -1588,6 +1611,8 @@ class AIAgent:
                     codex_message_items=msg.get("codex_message_items") if role == "assistant" else None,
                 )
             self._last_flushed_db_idx = len(messages)
+            self._last_flushed_session_id = self.session_id
+            self._session_rotated_since_flush = False
         except Exception as e:
             logger.warning("Session DB append_message failed: %s", e)
 

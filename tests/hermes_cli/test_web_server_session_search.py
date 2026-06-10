@@ -55,6 +55,10 @@ class _FakeSessionDB:
     def get_compression_tip(self, session_id):
         return session_id
 
+    def get_message_bearing_tip(self, session_id):
+        # Mirror SessionDB: no chain, sessions have messages → itself.
+        return session_id
+
     def close(self):
         self.closed = True
 
@@ -71,6 +75,7 @@ def test_desktop_session_search_merges_id_matches_before_content_matches(monkeyp
             {
                 "session_id": "20260603_090200_exact",
                 "lineage_root": "20260603_090200_exact",
+                "structural_tip": "20260603_090200_exact",
                 "snippet": "ID match preview",
                 "role": None,
                 "source": "cli",
@@ -80,6 +85,7 @@ def test_desktop_session_search_merges_id_matches_before_content_matches(monkeyp
             {
                 "session_id": "content_session",
                 "lineage_root": "content_session",
+                "structural_tip": "content_session",
                 "snippet": "content hit",
                 "role": "assistant",
                 "source": "desktop",

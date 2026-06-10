@@ -30,6 +30,7 @@ Session context:
 import io
 import logging
 import os
+import shutil
 import sys
 import threading
 from logging.handlers import RotatingFileHandler
@@ -51,6 +52,11 @@ _session_context = threading.local()
 # exist on every LogRecord via _install_session_record_factory() below.
 _LOG_FORMAT = "%(asctime)s %(levelname)s%(session_tag)s %(name)s: %(message)s"
 _LOG_FORMAT_VERBOSE = "%(asctime)s - %(name)s - %(levelname)s%(session_tag)s - %(message)s"
+_ROLLOVER_LOCK_TIMEOUT_SECONDS = 15.0
+
+
+def _is_windows() -> bool:
+    return os.name == "nt"
 
 
 def _safe_stderr():  # type: ignore[return]
@@ -466,12 +472,106 @@ class _ManagedRotatingFileHandler(RotatingFileHandler):
         self._chmod_if_managed()
         return stream
 
-    def doRollover(self):
-        super().doRollover()
+    def _rollover_lock_path(self) -> Path:
+        base = Path(self.baseFilename)
+        return base.with_name(f"{base.name}.rollover.lock")
+
+    def _flush_and_close_stream(self) -> None:
+        if self.stream is None:
+            return
+        try:
+            self.stream.flush()
+        except Exception:
+            pass
+        try:
+            self.stream.close()
+        except Exception:
+            pass
+        self.stream = None  # type: ignore[assignment]
+
+    def _reopen_after_rollover(self) -> None:
+        if self.stream is not None:
+            try:
+                self.stream.close()
+            except Exception:
+                pass
+            self.stream = None  # type: ignore[assignment]
+        if not self.delay:
+            try:
+                self.stream = self._open()
+            except Exception:
+                self.stream = None  # type: ignore[assignment]
         self._chmod_if_managed()
-        # Our own rollover writes a new baseFilename; refresh the snapshot
-        # so the next emit doesn't mistake it for external rotation.
         self._record_stream_stat()
+
+    def _rollover_still_needed(self) -> bool:
+        if self.maxBytes <= 0:
+            return True
+        try:
+            return os.path.getsize(self.baseFilename) >= self.maxBytes
+        except FileNotFoundError:
+            return False
+        except OSError:
+            return True
+
+    def _copy_path_best_effort(self, source: str, dest: str) -> bool:
+        try:
+            if os.path.exists(source):
+                shutil.copy2(source, dest)
+            return True
+        except OSError:
+            return False
+
+    def _do_windows_copy_truncate_rollover(self) -> None:
+        """Rotate Windows logs without renaming the live file.
+
+        Windows denies renaming a log that another Hermes process still has
+        open. Copying the live file to the backup slot and truncating it in
+        place avoids that shared-handle failure mode.
+        """
+        self._flush_and_close_stream()
+
+        if self.backupCount > 0 and os.path.exists(self.baseFilename):
+            for i in range(self.backupCount - 1, 0, -1):
+                source = f"{self.baseFilename}.{i}"
+                dest = f"{self.baseFilename}.{i + 1}"
+                self._copy_path_best_effort(source, dest)
+
+            if not self._copy_path_best_effort(self.baseFilename, f"{self.baseFilename}.1"):
+                self._reopen_after_rollover()
+                return
+
+            try:
+                with open(self.baseFilename, "w", encoding=self.encoding or "utf-8"):
+                    pass
+            except OSError:
+                self._reopen_after_rollover()
+                return
+
+        self._reopen_after_rollover()
+
+    def doRollover(self):
+        from utils import cross_process_file_lock
+
+        try:
+            with cross_process_file_lock(
+                self._rollover_lock_path(),
+                timeout_seconds=_ROLLOVER_LOCK_TIMEOUT_SECONDS,
+                timeout_message=f"Timed out waiting for log rollover lock: {self.baseFilename}",
+            ):
+                if not self._rollover_still_needed():
+                    self._reopen_after_rollover()
+                    return
+                if _is_windows():
+                    self._do_windows_copy_truncate_rollover()
+                else:
+                    super().doRollover()
+                    self._chmod_if_managed()
+                    self._record_stream_stat()
+        except (OSError, PermissionError, TimeoutError):
+            # Rollover must not break logging. Keep the live stream usable and
+            # try again on a later emit after other processes release handles.
+            self._reopen_after_rollover()
 
 
 def _add_rotating_handler(

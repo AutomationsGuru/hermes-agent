@@ -230,6 +230,11 @@ def _list_recent_sessions(db, limit: int, current_session_id: str = None) -> str
             limit=limit + 5,
             exclude_sources=list(_HIDDEN_SESSION_SOURCES),
             order_by_last_active=True,
+            # Sessions without messages are useless for recall, and projected
+            # compression tips can be accounting-only rows with zero persisted
+            # messages (#15000). min_message_count=1 makes list_sessions_rich
+            # surface the newest message-bearing segment of each chain instead.
+            min_message_count=1,
         )  # fetch extra so we can skip current
 
         current_root = _resolve_to_parent(db, current_session_id) if current_session_id else None

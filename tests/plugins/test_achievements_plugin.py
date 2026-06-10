@@ -376,3 +376,41 @@ def test_partial_snapshots_do_not_persist_unlock_timestamps(plugin_api):
         "partial scans must not record unlock timestamps — a later session "
         "could change whether the badge deserves to be unlocked yet"
     )
+
+
+def test_sidecar_saves_round_trip_with_lock_files(plugin_api):
+    plugin_api.save_state({"unlocks": {"badge": {"unlocked_at": "now"}}})
+    assert plugin_api.load_state()["unlocks"]["badge"]["unlocked_at"] == "now"
+    assert plugin_api.sidecar_lock_path(plugin_api.state_path()).exists()
+
+    plugin_api.save_snapshot({"seen": {"b", "a"}})
+    assert plugin_api.load_snapshot()["seen"] == ["a", "b"]
+    assert plugin_api.sidecar_lock_path(plugin_api.snapshot_path()).exists()
+
+    plugin_api.save_checkpoint({"schema_version": 1, "generated_at": 1, "sessions": {"s": {}}})
+    assert plugin_api.load_checkpoint()["sessions"] == {"s": {}}
+    assert plugin_api.sidecar_lock_path(plugin_api.checkpoint_path()).exists()
+
+
+def test_sidecar_saves_use_atomic_json_write_and_lock(plugin_api):
+    calls = []
+    original_write = plugin_api.atomic_json_write
+
+    def recording_write(path, data, **kwargs):
+        calls.append((Path(path), data, kwargs))
+        return original_write(path, data, **kwargs)
+
+    plugin_api.atomic_json_write = recording_write
+
+    plugin_api.save_state({"unlocks": {"badge": {"unlocked_at": 123}}})
+    plugin_api.save_snapshot({"generated_at": 123, "sessions": []})
+    plugin_api.save_checkpoint({"schema_version": 1, "generated_at": 123, "sessions": {}})
+
+    paths = [path for path, _data, _kwargs in calls]
+    assert [path.name for path in paths] == [
+        "state.json",
+        "scan_snapshot.json",
+        "scan_checkpoint.json",
+    ]
+    assert all(kwargs.get("sort_keys") is True for _path, _data, kwargs in calls)
+    assert all(plugin_api.sidecar_lock_path(path).exists() for path in paths)

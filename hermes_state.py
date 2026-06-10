@@ -1836,6 +1836,53 @@ class SessionDB:
             current = row["id"]
         return current
 
+    def get_message_bearing_tip(self, session_id: str) -> Optional[str]:
+        """Walk the compression chain forward and return the LATEST segment
+        that actually has message rows.
+
+        Compression can produce accounting-only continuation rows (api_call /
+        token counters but zero persisted messages — see #15000). For
+        user-facing surfaces that promise non-empty sessions, the structural
+        tip from :meth:`get_compression_tip` is the wrong answer when it is
+        one of those empty rows; the newest segment with a real transcript is
+        what the user can actually open/read.
+
+        Returns the session_id of the newest message-bearing segment in the
+        chain (which may be ``session_id`` itself), or ``None`` if no segment
+        in the chain has any messages.
+        """
+        # Collect the forward chain: start node + compression continuations.
+        chain = [session_id]
+        current = session_id
+        for _ in range(100):
+            with self._lock:
+                cursor = self._conn.execute(
+                    "SELECT id FROM sessions "
+                    "WHERE parent_session_id = ? "
+                    "  AND started_at >= ("
+                    "      SELECT ended_at FROM sessions "
+                    "      WHERE id = ? AND end_reason = 'compression'"
+                    "  ) "
+                    "ORDER BY started_at DESC LIMIT 1",
+                    (current, current),
+                )
+                row = cursor.fetchone()
+            if row is None:
+                break
+            current = row["id"]
+            chain.append(current)
+        # Newest-first: return the first segment with actual message rows.
+        for sid in reversed(chain):
+            with self._lock:
+                cursor = self._conn.execute(
+                    "SELECT EXISTS(SELECT 1 FROM messages WHERE session_id = ?)",
+                    (sid,),
+                )
+                has_messages = bool(cursor.fetchone()[0])
+            if has_messages:
+                return sid
+        return None
+
     def list_sessions_rich(
         self,
         source: str = None,
@@ -2075,6 +2122,39 @@ class SessionDB:
                     if key in tip_row:
                         merged[key] = tip_row[key]
                 merged["_lineage_root_id"] = s["id"]
+                merged["_structural_tip_id"] = tip_id
+                # Re-apply min_message_count AFTER projection. The SQL filter
+                # only saw the root row; the structural tip can be an
+                # accounting-only continuation with zero persisted messages
+                # (#15000), which would otherwise leak an empty row past a
+                # caller that explicitly asked for non-empty sessions (the
+                # dashboard recents / resume picker bug). Fall back to the
+                # newest message-bearing segment in the chain; drop the row
+                # only if no segment qualifies.
+                if (
+                    min_message_count > 0
+                    and (merged.get("message_count") or 0) < min_message_count
+                ):
+                    mb_id = self.get_message_bearing_tip(s["id"])
+                    mb_row = (
+                        self._get_session_rich_row(mb_id) if mb_id else None
+                    )
+                    if (
+                        mb_row
+                        and (mb_row.get("message_count") or 0) >= min_message_count
+                    ):
+                        merged = dict(s)
+                        for key in (
+                            "id", "ended_at", "end_reason", "message_count",
+                            "tool_call_count", "title", "last_active", "preview",
+                            "model", "system_prompt", "cwd",
+                        ):
+                            if key in mb_row:
+                                merged[key] = mb_row[key]
+                        merged["_lineage_root_id"] = s["id"]
+                        merged["_structural_tip_id"] = tip_id
+                        projected.append(merged)
+                    continue
                 projected.append(merged)
             sessions = projected
 

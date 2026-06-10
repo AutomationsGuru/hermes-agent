@@ -1,6 +1,6 @@
 """Tests for shared truthy-value helpers."""
 
-from utils import env_var_enabled, is_truthy_value
+from utils import cross_process_file_lock, env_var_enabled, is_truthy_value
 
 
 def test_is_truthy_value_accepts_common_truthy_strings():
@@ -27,3 +27,11 @@ def test_env_var_enabled_uses_shared_truthy_rules(monkeypatch):
 
     monkeypatch.setenv("HERMES_TEST_BOOL", "no")
     assert env_var_enabled("HERMES_TEST_BOOL") is False
+
+
+def test_cross_process_file_lock_is_reentrant_for_same_thread(tmp_path):
+    lock_path = tmp_path / "state.json.lock"
+
+    with cross_process_file_lock(lock_path):
+        with cross_process_file_lock(lock_path):
+            assert lock_path.exists()

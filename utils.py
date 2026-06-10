@@ -5,6 +5,9 @@ import logging
 import os
 import stat
 import tempfile
+import threading
+import time
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Union
 from urllib.parse import urlparse
@@ -13,8 +16,20 @@ import yaml
 
 logger = logging.getLogger(__name__)
 
+try:
+    import fcntl  # type: ignore
+except Exception:  # pragma: no cover - platform-dependent import
+    fcntl = None  # type: ignore[assignment]
+
+try:
+    import msvcrt  # type: ignore
+except Exception:  # pragma: no cover - platform-dependent import
+    msvcrt = None  # type: ignore[assignment]
+
 
 TRUTHY_STRINGS = frozenset({"1", "true", "yes", "on"})
+_FILE_LOCK_HOLDERS: dict[str, threading.local] = {}
+_FILE_LOCK_HOLDERS_LOCK = threading.Lock()
 
 
 def is_truthy_value(value: Any, default: bool = False) -> bool:
@@ -31,6 +46,81 @@ def is_truthy_value(value: Any, default: bool = False) -> bool:
 def env_var_enabled(name: str, default: str = "") -> bool:
     """Return True when an environment variable is set to a truthy value."""
     return is_truthy_value(os.getenv(name, default), default=False)
+
+
+def _holder_for_lock_path(lock_path: Path) -> threading.local:
+    key = str(lock_path.resolve(strict=False))
+    with _FILE_LOCK_HOLDERS_LOCK:
+        holder = _FILE_LOCK_HOLDERS.get(key)
+        if holder is None:
+            holder = threading.local()
+            _FILE_LOCK_HOLDERS[key] = holder
+        return holder
+
+
+@contextmanager
+def cross_process_file_lock(
+    lock_path: Union[str, Path],
+    *,
+    timeout_seconds: float = 15.0,
+    timeout_message: str | None = None,
+):
+    """Hold an advisory lock visible to sibling Hermes processes.
+
+    Uses ``fcntl.flock`` on POSIX and ``msvcrt.locking`` on Windows. The lock
+    is per-thread reentrant so nested callers can share a lock path without
+    deadlocking the process that already owns it.
+    """
+    lock_path = Path(lock_path)
+    holder = _holder_for_lock_path(lock_path)
+
+    depth = getattr(holder, "depth", 0)
+    if depth:
+        holder.depth = depth + 1
+        try:
+            yield
+        finally:
+            holder.depth -= 1
+        return
+
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    message = timeout_message or f"Timed out waiting for file lock: {lock_path}"
+
+    with lock_path.open("a+b") as lock_file:
+        if msvcrt is not None:
+            lock_file.seek(0, os.SEEK_END)
+            if lock_file.tell() == 0:
+                lock_file.write(b"\0")
+                lock_file.flush()
+
+        deadline = time.monotonic() + max(0.1, timeout_seconds)
+        acquired = False
+        while not acquired:
+            try:
+                if fcntl is not None:
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                elif msvcrt is not None:
+                    lock_file.seek(0)
+                    msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+                acquired = True
+            except (BlockingIOError, OSError, PermissionError):
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(message)
+                time.sleep(0.05)
+
+        holder.depth = 1
+        try:
+            yield
+        finally:
+            holder.depth = 0
+            try:
+                if fcntl is not None:
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+                elif msvcrt is not None:
+                    lock_file.seek(0)
+                    msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+            except (OSError, IOError):
+                pass
 
 
 def _preserve_file_mode(path: Path) -> "int | None":

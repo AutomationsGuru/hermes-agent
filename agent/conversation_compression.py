@@ -547,8 +547,14 @@ def compress_context(
                 except (ValueError, Exception) as e:
                     logger.debug("Could not propagate title on compression: %s", e)
             agent._session_db.update_system_prompt(agent.session_id, new_system_prompt)
-            # Reset flush cursor — new session starts with no messages written
+            # Reset flush cursor — new session starts with no messages written.
+            # Also flag the rotation so _flush_messages_to_session_db ignores
+            # any stale pre-compression conversation_history a finalizer or
+            # error path may still pass (it belongs to the OLD session row and
+            # would otherwise suppress all writes to this continuation —
+            # see #15000).
             agent._last_flushed_db_idx = 0
+            agent._session_rotated_since_flush = True
         except Exception as e:
             logger.warning("Session DB compression split failed — new session will NOT be indexed: %s", e)
 

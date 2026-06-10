@@ -331,6 +331,7 @@ class TestStdinHelpers:
         pty.sendeof.assert_called_once()
         assert result["status"] == "ok"
 
+    @pytest.mark.skipif(sys.platform == "win32", reason="PTY EOF subprocess semantics differ on Windows")
     def test_close_stdin_allows_eof_driven_process_to_finish(self, registry, tmp_path):
         """PTY mode: writing data + sending EOF lets an EOF-driven child finish.
 
@@ -626,6 +627,7 @@ class TestSpawnEnvSanitization:
 class TestPopenLeakOnSetupFailure:
     """Regression for issue #2749: subprocess orphaned when post-Popen setup raises."""
 
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX process-group cleanup path uses os.getpgid")
     def test_popen_killed_when_thread_creation_fails(self, registry):
         """If Thread() raises after Popen, proc must be killed — not orphaned."""
         killed = []
@@ -663,6 +665,7 @@ class TestPopenLeakOnSetupFailure:
 
         assert killed, "proc.kill() must be called when post-Popen setup raises"
 
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX process-group cleanup path uses os.getpgid")
     def test_popen_killed_when_write_checkpoint_fails(self, registry):
         """If _write_checkpoint raises after Popen, proc must still be killed."""
         killed = []
@@ -737,6 +740,54 @@ class TestCheckpoint:
             data = json.loads((tmp_path / "procs.json").read_text())
             assert len(data) == 1
             assert data[0]["session_id"] == s.id
+            assert data[0]["registry_id"] == registry._registry_id
+
+    def test_write_checkpoint_preserves_sibling_registry_entries(self, registry, tmp_path):
+        checkpoint = tmp_path / "procs.json"
+        sibling = {
+            "session_id": "proc_sibling",
+            "registry_id": "other-registry",
+            "command": "sleep 999",
+            "pid": 12345,
+            "pid_scope": "host",
+        }
+        stale_own = {
+            "session_id": "proc_stale_own",
+            "registry_id": registry._registry_id,
+            "command": "finished",
+            "pid": 67890,
+            "pid_scope": "host",
+        }
+        checkpoint.write_text(json.dumps([sibling, stale_own]), encoding="utf-8")
+
+        with patch("tools.process_registry.CHECKPOINT_PATH", checkpoint):
+            s = _make_session(sid="proc_current")
+            registry._running[s.id] = s
+            registry._write_checkpoint()
+
+        data = json.loads(checkpoint.read_text(encoding="utf-8"))
+        by_id = {entry["session_id"]: entry for entry in data}
+        assert set(by_id) == {"proc_sibling", "proc_current"}
+        assert by_id["proc_sibling"] == sibling
+        assert by_id["proc_current"]["registry_id"] == registry._registry_id
+
+    def test_write_checkpoint_preserves_legacy_unknown_entries(self, registry, tmp_path):
+        checkpoint = tmp_path / "procs.json"
+        legacy = {
+            "session_id": "proc_legacy",
+            "command": "sleep 999",
+            "pid": 12345,
+            "pid_scope": "host",
+        }
+        checkpoint.write_text(json.dumps([legacy]), encoding="utf-8")
+
+        with patch("tools.process_registry.CHECKPOINT_PATH", checkpoint):
+            s = _make_session(sid="proc_current")
+            registry._running[s.id] = s
+            registry._write_checkpoint()
+
+        data = json.loads(checkpoint.read_text(encoding="utf-8"))
+        assert {entry["session_id"] for entry in data} == {"proc_legacy", "proc_current"}
 
     def test_recover_no_file(self, registry, tmp_path):
         with patch("tools.process_registry.CHECKPOINT_PATH", tmp_path / "missing.json"):
@@ -915,6 +966,7 @@ class TestKillProcess:
         result = registry.kill_process(s.id)
         assert result["status"] == "already_exited"
 
+    @pytest.mark.skipif(sys.platform == "win32", reason="test asserts POSIX psutil termination path")
     def test_kill_detached_session_uses_host_pid(self, registry):
         s = _make_session(sid="proc_detached", command="sleep 999")
         s.pid = 424242
