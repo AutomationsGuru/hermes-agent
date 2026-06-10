@@ -1249,7 +1249,9 @@ class TestGeminiCloudCodeClient:
             {"tool_choice": {"type": "function", "function": {"name": "lookup"}}},
         ],
     )
-    def test_antigravity_cascade_rejects_tool_modes(self, kwargs):
+    def test_antigravity_cascade_rejects_tool_modes_on_non_target_model(self, kwargs):
+        # antigravity-cascade is the Gemini/Flash route — tool calling is gated
+        # to the cross-vendor targets only, so tool modes here still raise.
         from agent.gemini_cloudcode_adapter import GeminiCloudCodeClient
         from agent.google_code_assist import CodeAssistError
 
@@ -1264,8 +1266,8 @@ class TestGeminiCloudCodeClient:
         finally:
             client.close()
 
-        assert "does not support Hermes tool calls yet" in str(exc_info.value)
         assert exc_info.value.code == "antigravity_cascade_tools_unsupported"
+        assert "gpt-oss-120b-medium" in str(exc_info.value)
 
     @staticmethod
     def _fake_cascade_client_class(events):
@@ -1631,6 +1633,287 @@ class TestGeminiCloudCodeClient:
         assert resp.choices[0].message.content == "OK"
         assert resp.choices[0].finish_reason == "stop"
         assert fake_class.instances[0].pulled == 3
+
+
+class TestAntigravityToolCallingHelpers:
+    """Pure-function coverage for the Option-A tool-calling helpers."""
+
+    def test_parse_clean_tool_call(self):
+        from agent.gemini_cloudcode_adapter import _parse_antigravity_tool_calls
+
+        text = '{"tool_calls": [{"name": "get_weather", "arguments": {"city": "Paris"}}]}'
+        calls = _parse_antigravity_tool_calls(text, {"get_weather"})
+        assert len(calls) == 1
+        assert calls[0]["function"]["name"] == "get_weather"
+        assert json.loads(calls[0]["function"]["arguments"]) == {"city": "Paris"}
+        assert calls[0]["id"].startswith("call_")
+
+    def test_parse_tolerant_of_prose_and_fences(self):
+        from agent.gemini_cloudcode_adapter import _parse_antigravity_tool_calls
+
+        text = (
+            "Sure, I'll look that up.\n```json\n"
+            '{"tool_call": {"name": "lookup", "arguments": {"q": "x"}}}\n```'
+        )
+        calls = _parse_antigravity_tool_calls(text, {"lookup"})
+        assert len(calls) == 1 and calls[0]["function"]["name"] == "lookup"
+
+    def test_parse_bare_object_shape(self):
+        from agent.gemini_cloudcode_adapter import _parse_antigravity_tool_calls
+
+        calls = _parse_antigravity_tool_calls(
+            '{"name": "lookup", "arguments": {}}', {"lookup"}
+        )
+        assert len(calls) == 1 and calls[0]["function"]["name"] == "lookup"
+
+    def test_parse_rejects_unknown_tool_name(self):
+        from agent.gemini_cloudcode_adapter import _parse_antigravity_tool_calls
+
+        # JSON that isn't an offered tool must NOT be treated as a tool call.
+        calls = _parse_antigravity_tool_calls(
+            '{"name": "not_a_tool", "arguments": {}}', {"lookup"}
+        )
+        assert calls == []
+
+    def test_parse_plain_answer_is_not_a_tool_call(self):
+        from agent.gemini_cloudcode_adapter import _parse_antigravity_tool_calls
+
+        calls = _parse_antigravity_tool_calls("The weather is sunny.", {"get_weather"})
+        assert calls == []
+
+    def test_extract_handles_braces_inside_strings(self):
+        from agent.gemini_cloudcode_adapter import _extract_first_json_object
+
+        got = _extract_first_json_object('prefix {"a": "has } brace"} suffix')
+        assert got == '{"a": "has } brace"}'
+
+    def test_preamble_lists_tools_and_forbids_workspace(self):
+        from agent.gemini_cloudcode_adapter import _render_antigravity_tool_preamble
+
+        tools = [{"type": "function", "function": {"name": "get_weather",
+                  "description": "weather", "parameters": {"type": "object"}}}]
+        pre = _render_antigravity_tool_preamble(tools, None)
+        assert "get_weather" in pre
+        assert "NO workspace" in pre
+        assert "tool_calls" in pre
+
+    def test_round_trip_renders_prior_tool_call_and_result(self):
+        from agent.gemini_cloudcode_adapter import _build_antigravity_cascade_prompt
+
+        prompt = _build_antigravity_cascade_prompt([
+            {"role": "user", "content": "weather in Paris?"},
+            {"role": "assistant", "content": None, "tool_calls": [
+                {"id": "call_1", "type": "function",
+                 "function": {"name": "get_weather", "arguments": '{"city": "Paris"}'}}]},
+            {"role": "tool", "name": "get_weather", "content": '{"temp_c": 21}'},
+        ])
+        assert "Assistant (tool call):" in prompt
+        assert "get_weather" in prompt
+        assert "Tool result (get_weather): {\"temp_c\": 21}" in prompt
+        assert "tool calls omitted" not in prompt
+
+    def test_last_message_is_tool_result_detection(self):
+        from agent.gemini_cloudcode_adapter import (
+            _antigravity_last_message_is_tool_result,
+        )
+
+        assert _antigravity_last_message_is_tool_result([
+            {"role": "user", "content": "x"},
+            {"role": "assistant", "content": None, "tool_calls": [{"id": "c"}]},
+            {"role": "tool", "name": "t", "content": "r"},
+        ])
+        assert not _antigravity_last_message_is_tool_result([
+            {"role": "tool", "content": "r"},
+            {"role": "user", "content": "follow-up"},
+        ])
+        assert not _antigravity_last_message_is_tool_result([
+            {"role": "user", "content": "x"},
+        ])
+
+
+class TestAntigravityToolCallingRoute:
+    """End-to-end tool calling on a target (cross-vendor) model via a fake client."""
+
+    def _patch(self, monkeypatch, replies):
+        """Patch a cascade client that returns ``replies`` (one per turn)."""
+        from agent import gemini_cloudcode_adapter
+
+        class FakeToolClient:
+            instances = []
+            turn = 0
+
+            def __init__(self):
+                FakeToolClient.instances.append(self)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_a):
+                return None
+
+            def start_cascade(self, *, model_enum):
+                self.model_enum = model_enum
+                return SimpleNamespace(cascade_id="c")
+
+            def send_user_message(self, cascade_id, message):
+                return 200
+
+            def stream_agent_state_updates(self, cascade_id, *, max_events):
+                reply = replies[min(FakeToolClient.turn, len(replies) - 1)]
+                FakeToolClient.turn += 1
+                yield SimpleNamespace(type="assistant_text", text=reply)
+                yield SimpleNamespace(type="done", text="", conversation_done=True)
+
+        FakeToolClient.turn = 0
+        monkeypatch.setattr(
+            gemini_cloudcode_adapter, "AntigravityCascadeClient", FakeToolClient
+        )
+        return FakeToolClient
+
+    _TOOLS = [{
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "description": "Get weather",
+            "parameters": {
+                "type": "object",
+                "properties": {"city": {"type": "string"}},
+            },
+        },
+    }]
+
+    def test_target_model_emits_tool_calls(self, monkeypatch):
+        from agent.gemini_cloudcode_adapter import GeminiCloudCodeClient
+
+        self._patch(monkeypatch, [
+            '{"tool_calls": [{"name": "get_weather", "arguments": {"city": "Paris"}}]}'
+        ])
+        client = GeminiCloudCodeClient(api_key="dummy")
+        try:
+            resp = client.chat.completions.create(
+                model="antigravity-gpt-oss-120b-medium",
+                messages=[{"role": "user", "content": "weather in Paris?"}],
+                tools=self._TOOLS,
+            )
+        finally:
+            client.close()
+
+        choice = resp.choices[0]
+        assert choice.finish_reason == "tool_calls"
+        assert choice.message.content is None
+        assert choice.message.tool_calls[0].function.name == "get_weather"
+        assert json.loads(choice.message.tool_calls[0].function.arguments) == {"city": "Paris"}
+
+    def test_target_model_plain_answer_passes_through(self, monkeypatch):
+        from agent.gemini_cloudcode_adapter import GeminiCloudCodeClient
+
+        self._patch(monkeypatch, ["It is sunny in Paris."])
+        client = GeminiCloudCodeClient(api_key="dummy")
+        try:
+            resp = client.chat.completions.create(
+                model="antigravity-gpt-oss-120b-medium",
+                messages=[{"role": "user", "content": "weather?"}],
+                tools=self._TOOLS,
+            )
+        finally:
+            client.close()
+        assert resp.choices[0].finish_reason == "stop"
+        assert resp.choices[0].message.content == "It is sunny in Paris."
+        assert resp.choices[0].message.tool_calls is None
+
+    def test_forced_tool_choice_repair_retry(self, monkeypatch):
+        from agent.gemini_cloudcode_adapter import GeminiCloudCodeClient
+
+        # First reply is prose; with tool_choice forcing, a repair retry asks
+        # again and the second reply is a valid tool call.
+        self._patch(monkeypatch, [
+            "I think I should look that up.",
+            '{"tool_calls": [{"name": "get_weather", "arguments": {"city": "Paris"}}]}',
+        ])
+        client = GeminiCloudCodeClient(api_key="dummy")
+        try:
+            resp = client.chat.completions.create(
+                model="antigravity-gpt-oss-120b-medium",
+                messages=[{"role": "user", "content": "weather?"}],
+                tools=self._TOOLS,
+                tool_choice="required",
+            )
+        finally:
+            client.close()
+        assert resp.choices[0].finish_reason == "tool_calls"
+        assert resp.choices[0].message.tool_calls[0].function.name == "get_weather"
+
+    def test_tool_result_turn_synthesizes_answer(self, monkeypatch):
+        # When the latest message is a tool result, the answer-focused synthesis
+        # path lets the model reply in plain text instead of re-calling the tool.
+        from agent.gemini_cloudcode_adapter import GeminiCloudCodeClient
+
+        self._patch(monkeypatch, [
+            "The order is out for delivery, arriving today by 5pm."
+        ])
+        client = GeminiCloudCodeClient(api_key="dummy")
+        try:
+            resp = client.chat.completions.create(
+                model="antigravity-gpt-oss-120b-medium",
+                tools=self._TOOLS,
+                messages=[
+                    {"role": "user", "content": "status of ORD-1?"},
+                    {"role": "assistant", "content": None, "tool_calls": [
+                        {"id": "c1", "type": "function",
+                         "function": {"name": "get_weather", "arguments": "{}"}}]},
+                    {"role": "tool", "name": "get_weather", "content": '{"x": 1}'},
+                ],
+            )
+        finally:
+            client.close()
+        assert resp.choices[0].finish_reason == "stop"
+        assert resp.choices[0].message.tool_calls is None
+        assert "delivery" in (resp.choices[0].message.content or "")
+
+    def test_claude_models_are_chat_only_for_tools(self, monkeypatch):
+        # Claude models are gated OUT of tool calling (they don't reliably emit
+        # tool calls over the Cascade route); requesting tools gives a clear,
+        # chat-only error rather than hanging a real agent loop.
+        from agent.gemini_cloudcode_adapter import GeminiCloudCodeClient
+        from agent.google_code_assist import CodeAssistError
+
+        for model in (
+            "antigravity-claude-sonnet-4-6",
+            "antigravity-claude-opus-4-6-thinking",
+        ):
+            client = GeminiCloudCodeClient(api_key="dummy")
+            try:
+                with pytest.raises(CodeAssistError) as exc_info:
+                    client.chat.completions.create(
+                        model=model,
+                        messages=[{"role": "user", "content": "hi"}],
+                        tools=self._TOOLS,
+                    )
+            finally:
+                client.close()
+            assert exc_info.value.code == "antigravity_cascade_tools_unsupported"
+            assert "chat" in str(exc_info.value).lower()
+
+    def test_streaming_tool_call_emits_tool_calls_chunk(self, monkeypatch):
+        from agent.gemini_cloudcode_adapter import GeminiCloudCodeClient
+
+        self._patch(monkeypatch, [
+            '{"tool_calls": [{"name": "get_weather", "arguments": {"city": "Paris"}}]}'
+        ])
+        client = GeminiCloudCodeClient(api_key="dummy")
+        try:
+            chunks = list(client.chat.completions.create(
+                model="antigravity-gpt-oss-120b-medium",
+                messages=[{"role": "user", "content": "weather?"}],
+                tools=self._TOOLS,
+                stream=True,
+            ))
+        finally:
+            client.close()
+        tool_chunks = [c for c in chunks if c.choices[0].delta.tool_calls]
+        assert tool_chunks, "expected a chunk carrying tool_calls"
+        assert tool_chunks[0].choices[0].delta.tool_calls[0].function.name == "get_weather"
+        assert chunks[-1].choices[0].finish_reason == "tool_calls"
 
 
 class TestGeminiHttpErrorParsing:

@@ -177,6 +177,27 @@ _ANTIGRAVITY_BACKEND_MODELS: frozenset[str] = frozenset(
     if alias.route == GOOGLE_GEMINI_CLI_ROUTE_ANTIGRAVITY
 )
 
+# SINGLE SOURCE OF TRUTH for which Antigravity backend enums support Hermes-side
+# (Option A) tool calling. The adapter's runtime tool gate AND
+# google_gemini_cli_model_capabilities() below both read these, so the
+# advertised capability can never drift from what the adapter enforces.
+#
+# As of 2026-06-10, only GPT-OSS-120B reliably emits prompt-injected tool calls
+# over the Cascade route. The Claude models, wrapped in Antigravity's own agent
+# persona, do NOT (Opus answers without calling; Sonnet deliberates ~60s and
+# truncates), so they are tool-gated OFF and remain chat-only. Gemini presets
+# are likewise not tool-enabled here (use the normal google provider for tools).
+# Re-enable a model here ONLY after live re-verification.
+ANTIGRAVITY_TOOL_ENABLED_ENUMS: frozenset[str] = frozenset({
+    "MODEL_OPENAI_GPT_OSS_120B_MEDIUM",  # antigravity-gpt-oss-120b-medium
+})
+# Cross-vendor models that are chat-capable but NOT reliable for tools — used to
+# give a clear, specific "chat-only" error/marker instead of a generic one.
+ANTIGRAVITY_TOOL_UNRELIABLE_ENUMS: frozenset[str] = frozenset({
+    "MODEL_PLACEHOLDER_M35",  # antigravity-claude-sonnet-4-6 (Thinking)
+    "MODEL_PLACEHOLDER_M26",  # antigravity-claude-opus-4-6-thinking
+})
+
 
 def is_antigravity_backend_model(model: str) -> bool:
     """Return whether ``model`` is a curated Antigravity backend enum.
@@ -196,24 +217,29 @@ def google_gemini_cli_model_capabilities(model: str) -> dict[str, Any]:
     alias = _ALIAS_BY_KEY.get(_normalize_alias_key(model))
     route = alias.route if alias is not None else GOOGLE_GEMINI_CLI_ROUTE_CLOUDCODE
     if route == GOOGLE_GEMINI_CLI_ROUTE_ANTIGRAVITY:
+        # Per-model tool support, read from the same set the adapter's runtime
+        # gate enforces — so capabilities never over-promise. Only GPT-OSS is
+        # tool-capable today; the Claude presets are chat-only (see the set's
+        # comment). The Cascade route flattens input to text (text_only).
+        backend = alias.backend_model if alias is not None else ""
+        tools_ok = backend in ANTIGRAVITY_TOOL_ENABLED_ENUMS
         return {
             "route": GOOGLE_GEMINI_CLI_ROUTE_ANTIGRAVITY,
-            # The Cascade route flattens messages to a single text prompt
-            # (non-text parts are dropped) and rejects Hermes tool calls, so it
-            # is text-only for input — advertise that honestly so upstream does
-            # not send multimodal parts the route would silently degrade.
             "text_only": True,
-            "tool_calls": False,
+            "tool_calls": tools_ok,
+            "chat_only": not tools_ok,
+            "tool_calls_models": ("openai",) if tools_ok else (),
             "observed_workspace_tools": True,
             "auto_execute_tools": False,
             "auto_ack_edits": False,
-            "streaming": "parsed_events",
+            "streaming": "openai_chunks",
             "requires_local_antigravity": True,
         }
     return {
         "route": GOOGLE_GEMINI_CLI_ROUTE_CLOUDCODE,
         "text_only": False,
         "tool_calls": True,
+        "chat_only": False,
         "observed_workspace_tools": False,
         "auto_execute_tools": True,
         "auto_ack_edits": False,

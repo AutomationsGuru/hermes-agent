@@ -216,3 +216,57 @@ class TestRouteHint:
             google_gemini_cli_route_from_extra_body(extra_body)
             == GOOGLE_GEMINI_CLI_ROUTE_CLOUDCODE
         )
+
+
+class TestAntigravityCapabilityParity:
+    """The advertised per-model tool capability must match the adapter's gate."""
+
+    def test_capabilities_match_tool_enabled_set(self):
+        from agent.gemini_cloudcode_models import (
+            ANTIGRAVITY_TOOL_ENABLED_ENUMS,
+            GOOGLE_GEMINI_CLI_APP_ALIASES,
+            google_gemini_cli_model_capabilities,
+        )
+
+        for alias in GOOGLE_GEMINI_CLI_APP_ALIASES:
+            caps = google_gemini_cli_model_capabilities(alias.picker_id)
+            expected = alias.backend_model in ANTIGRAVITY_TOOL_ENABLED_ENUMS
+            assert caps["tool_calls"] is expected, alias.picker_id
+            assert caps["chat_only"] is (not expected), alias.picker_id
+
+    def test_claude_chat_only_gpt_oss_tools(self):
+        from agent.gemini_cloudcode_models import (
+            google_gemini_cli_model_capabilities,
+        )
+
+        for cid in (
+            "antigravity-claude-sonnet-4-6",
+            "antigravity-claude-opus-4-6-thinking",
+        ):
+            caps = google_gemini_cli_model_capabilities(cid)
+            assert caps["chat_only"] is True
+            assert caps["tool_calls"] is False
+            assert caps["tool_calls_models"] == ()
+        gpt = google_gemini_cli_model_capabilities("antigravity-gpt-oss-120b-medium")
+        assert gpt["chat_only"] is False
+        assert gpt["tool_calls"] is True
+        assert gpt["tool_calls_models"] == ("openai",)
+
+    def test_adapter_gate_and_capabilities_share_one_set(self):
+        # Single source of truth: the adapter imports the same frozenset object,
+        # so the advertised capability can never drift from the runtime gate.
+        import agent.gemini_cloudcode_adapter as adapter
+        from agent.gemini_cloudcode_models import ANTIGRAVITY_TOOL_ENABLED_ENUMS
+
+        assert adapter.ANTIGRAVITY_TOOL_ENABLED_ENUMS is ANTIGRAVITY_TOOL_ENABLED_ENUMS
+
+    def test_chat_only_marker_suffix(self):
+        from hermes_cli.auth import _antigravity_chat_only_suffix
+
+        assert "chat-only" in _antigravity_chat_only_suffix(
+            "antigravity-claude-sonnet-4-6"
+        )
+        assert _antigravity_chat_only_suffix("antigravity-gpt-oss-120b-medium") == ""
+        # Real anthropic catalog id (not antigravity-prefixed) is never marked,
+        # even though its raw slug alias-resolves.
+        assert _antigravity_chat_only_suffix("claude-sonnet-4-6") == ""
