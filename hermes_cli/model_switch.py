@@ -1180,7 +1180,7 @@ def list_authenticated_providers(
     custom_providers: list | None = None,
     *,
     force_fresh_nous_tier: bool = False,
-    max_models: int = 8,
+    max_models: int = 50,
     current_model: str = "",
 ) -> List[dict]:
     """Detect which providers have credentials and list their curated models.
@@ -1957,6 +1957,17 @@ def list_authenticated_providers(
             seen_slugs.add(slug.lower())
             _section4_emitted_slugs.add(slug.lower())
 
+    # Agent OS picker governance: show only approved provider/model rows.
+    # This is display hygiene only; typed/manual model switches still flow
+    # through validate_requested_model unless strict enforcement is added.
+    try:
+        from hermes_cli.model_governance import filter_provider_rows_for_approved_picker
+
+        results = filter_provider_rows_for_approved_picker(results, max_models=max_models)
+    except Exception:
+        # Never break the picker on a policy helper import/runtime issue.
+        pass
+
     # Sort: current provider first, then by model count descending
     results.sort(key=lambda r: (not r["is_current"], -r["total_models"]))
 
@@ -1968,7 +1979,7 @@ def list_picker_providers(
     current_base_url: str = "",
     user_providers: dict = None,
     custom_providers: list | None = None,
-    max_models: int = 8,
+    max_models: int = 50,
     current_model: str = "",
 ) -> List[dict]:
     """Interactive-picker variant of :func:`list_authenticated_providers`.
@@ -2019,5 +2030,12 @@ def list_picker_providers(
         if not has_models and not is_custom_endpoint:
             continue
         filtered.append(p)
+
+    try:
+        from hermes_cli.model_governance import filter_provider_rows_for_approved_picker
+
+        filtered = filter_provider_rows_for_approved_picker(filtered, max_models=max_models)
+    except Exception:
+        pass
 
     return filtered

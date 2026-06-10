@@ -16,7 +16,10 @@ from difflib import get_close_matches
 from pathlib import Path
 from typing import Any, NamedTuple, Optional
 
-from agent.gemini_cloudcode_models import GOOGLE_GEMINI_CLI_APP_MODEL_IDS
+from agent.gemini_cloudcode_models import (
+    GOOGLE_GEMINI_CLI_APP_MODEL_IDS,
+    build_google_gemini_cli_picker_models,
+)
 from hermes_cli import __version__ as _HERMES_VERSION
 
 # Identify ourselves so endpoints fronted by Cloudflare's Browser Integrity
@@ -330,6 +333,7 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         "MiniMax-M2",
     ],
     "anthropic": [
+        "claude-fable-5",
         "claude-opus-4-8",
         "claude-opus-4-7",
         "claude-opus-4-6",
@@ -2279,6 +2283,26 @@ def _merge_with_models_dev(provider: str, curated: list[str]) -> list[str]:
     return merged
 
 
+def _fetch_google_gemini_cli_quota_model_ids() -> list[str]:
+    """Best-effort live model IDs from Code Assist quota buckets.
+
+    Cloud Code Assist does not expose a public OpenAI-style /models endpoint,
+    but retrieveUserQuota returns bucket model IDs for the authenticated
+    account. Treat those as the account-specific live catalog supplement.
+    """
+    try:
+        from agent.google_oauth import get_valid_access_token, load_credentials
+        from agent.google_code_assist import retrieve_user_quota
+
+        access_token = get_valid_access_token()
+        creds = load_credentials()
+        project_id = (creds.project_id if creds else "") or ""
+        buckets = retrieve_user_quota(access_token, project_id=project_id)
+        return [b.model_id for b in buckets if getattr(b, "model_id", "")]
+    except Exception:
+        return []
+
+
 def provider_model_ids(provider: Optional[str], *, force_refresh: bool = False) -> list[str]:
     """Return the best known model catalog for a provider.
 
@@ -2310,13 +2334,21 @@ def provider_model_ids(provider: Optional[str], *, force_refresh: bool = False) 
     if normalized == "xai-oauth":
         return list(_PROVIDER_MODELS.get("xai-oauth", _PROVIDER_MODELS.get("xai", [])))
     if normalized == "google-gemini-cli":
-        # Static curated catalog + honest availability: antigravity-route
-        # entries are hidden while the local Antigravity language server is
-        # unreachable, so the picker never offers models that cannot answer.
-        # Cloudcode-route models are never touched. The probe is local-only,
-        # process-memoized, and never raises.
+        # Reconciled: main's live quota-aware discovery, unioned with the
+        # static curated catalog (which carries the GA gemini-3.5-flash slug
+        # and the antigravity-cascade route alias), then honest availability
+        # gating — antigravity-route entries are hidden while the local
+        # Antigravity language server is unreachable, so the picker never
+        # offers models that cannot answer. Cloudcode-route models are never
+        # touched; the probe is local-only, process-memoized, and never raises.
+        picker = build_google_gemini_cli_picker_models(
+            _fetch_google_gemini_cli_quota_model_ids()
+        )
+        for extra in _PROVIDER_MODELS.get("google-gemini-cli", []):
+            if extra not in picker:
+                picker.append(extra)
         return filter_unavailable_google_gemini_cli_models(
-            _PROVIDER_MODELS.get("google-gemini-cli", []),
+            picker,
             force_refresh=force_refresh,
         )
     if normalized in {"copilot", "copilot-acp"}:
@@ -2361,7 +2393,20 @@ def provider_model_ids(provider: Optional[str], *, force_refresh: bool = False) 
     if normalized == "anthropic":
         live = _fetch_anthropic_models()
         if live:
-            return live
+            # The live /v1/models dump lags newly-routed curated aliases
+            # (e.g. claude-fable-5, which is reachable on Anthropic before it
+            # is enumerated by the models endpoint). Surface curated entries
+            # first, then append any live-only models, so a fresh curated
+            # model never disappears just because the API hasn't listed it yet.
+            curated = list(_PROVIDER_MODELS.get("anthropic", []))
+            merged = list(curated)
+            merged_lower = {m.lower() for m in curated}
+            for m in live:
+                if m.lower() not in merged_lower:
+                    merged.append(m)
+                    merged_lower.add(m.lower())
+            return merged
+        return list(_PROVIDER_MODELS.get("anthropic", []))
     if normalized == "ollama-cloud":
         live = fetch_ollama_cloud_models(force_refresh=force_refresh)
         if live:

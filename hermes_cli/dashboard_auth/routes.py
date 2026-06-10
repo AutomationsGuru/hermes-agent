@@ -128,7 +128,13 @@ def _prefix(request: Request) -> str:
 
 
 @router.get("/login", name="login_page")
-async def login_page(request: Request) -> HTMLResponse:
+async def login_page(request: Request):
+    # If the dashboard was started without the auth gate (for example a
+    # trusted private-LAN --insecure bind), /login should not strand users on
+    # the auth bootstrap page. Redirect stale /login tabs back to the SPA.
+    if not getattr(request.app.state, "auth_required", False):
+        return RedirectResponse(url="/", status_code=302)
+
     # Read the ``next=`` query the gate's ``_unauth_response`` set on
     # the redirect URL. Validate against the same same-origin rules the
     # callback applies (defence in depth — the gate already filters,

@@ -2288,18 +2288,14 @@ def get_model_options():
     try:
         from hermes_cli.inventory import build_models_payload, load_picker_context
 
-        # include_unconfigured + picker_hints + canonical_order mirror the
-        # tui_gateway `model.options` JSON-RPC handler exactly, so every GUI
-        # surface fed by this endpoint (Settings → Model, the first-run
-        # onboarding picker) sees the SAME full provider universe `hermes model`
-        # exposes — not just the authenticated subset. Unconfigured providers
-        # come back as skeleton rows carrying `authenticated=False` +
-        # `auth_type`/`key_env`/`warning` so the GUI can render a setup
-        # affordance instead of hiding the provider entirely.
+        # The Agent OS picker is intentionally usage-focused: show only
+        # authenticated/configured providers after approved-roster filtering.
+        # Setup/unconfigured provider discovery remains available through
+        # explicit auth/setup flows, not the day-to-day model picker.
         return build_models_payload(
             load_picker_context(),
             max_models=50,
-            include_unconfigured=True,
+            include_unconfigured=False,
             picker_hints=True,
             canonical_order=True,
             pricing=True,
