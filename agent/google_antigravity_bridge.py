@@ -313,6 +313,9 @@ def stream_antigravity_text_response(
 ) -> Iterator[SimpleNamespace]:
     """Yield OpenAI-chat-shaped streaming chunks for text-only responses."""
 
+    # All chunks of one completion must share a single id (OpenAI streaming
+    # protocol); generate it once rather than per chunk.
+    response_id = f"chatcmpl-antigravity-{uuid.uuid4().hex[:12]}"
     delta = SimpleNamespace(
         role="assistant",
         content=str(text or ""),
@@ -321,7 +324,7 @@ def stream_antigravity_text_response(
         reasoning_content=None,
     )
     yield SimpleNamespace(
-        id=f"chatcmpl-antigravity-{uuid.uuid4().hex[:12]}",
+        id=response_id,
         object="chat.completion.chunk",
         created=int(time.time()),
         model=model,
@@ -336,7 +339,7 @@ def stream_antigravity_text_response(
         reasoning_content=None,
     )
     yield SimpleNamespace(
-        id=f"chatcmpl-antigravity-{uuid.uuid4().hex[:12]}",
+        id=response_id,
         object="chat.completion.chunk",
         created=int(time.time()),
         model=model,

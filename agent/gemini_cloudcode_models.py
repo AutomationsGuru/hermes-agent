@@ -171,6 +171,25 @@ for _manual_key, _picker_id in _MANUAL_ALIAS_SPELLINGS.items():
     )
 
 
+_ANTIGRAVITY_BACKEND_MODELS: frozenset[str] = frozenset(
+    alias.backend_model
+    for alias in GOOGLE_GEMINI_CLI_APP_ALIASES
+    if alias.route == GOOGLE_GEMINI_CLI_ROUTE_ANTIGRAVITY
+)
+
+
+def is_antigravity_backend_model(model: str) -> bool:
+    """Return whether ``model`` is a curated Antigravity backend enum.
+
+    Used to gate the private antigravity route hint: a caller-supplied hint must
+    never reroute an arbitrary model (e.g. a Cloud Code slug) to Cascade — only
+    enums that alias resolution actually produces for an Antigravity-routed
+    picker entry are eligible.
+    """
+
+    return str(model or "").strip() in _ANTIGRAVITY_BACKEND_MODELS
+
+
 def google_gemini_cli_model_capabilities(model: str) -> dict[str, Any]:
     """Return Hermes capability metadata for a google-gemini-cli model ID."""
 
@@ -179,7 +198,11 @@ def google_gemini_cli_model_capabilities(model: str) -> dict[str, Any]:
     if route == GOOGLE_GEMINI_CLI_ROUTE_ANTIGRAVITY:
         return {
             "route": GOOGLE_GEMINI_CLI_ROUTE_ANTIGRAVITY,
-            "text_only": False,
+            # The Cascade route flattens messages to a single text prompt
+            # (non-text parts are dropped) and rejects Hermes tool calls, so it
+            # is text-only for input — advertise that honestly so upstream does
+            # not send multimodal parts the route would silently degrade.
+            "text_only": True,
             "tool_calls": False,
             "observed_workspace_tools": True,
             "auto_execute_tools": False,

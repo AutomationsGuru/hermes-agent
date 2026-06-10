@@ -103,6 +103,9 @@ def discover_antigravity_roster(
     close_client = client is None
     http = client or httpx.Client(
         timeout=httpx.Timeout(connect=5.0, read=30.0, write=10.0, pool=10.0),
+        # Antigravity's local server uses a self-signed certificate on
+        # 127.0.0.1; certificate verification is intentionally disabled for
+        # this loopback-only connection (matches the bridge/cascade clients).
         verify=False,
     )
     try:

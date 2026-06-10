@@ -41,6 +41,7 @@ from agent import google_oauth
 from agent.gemini_cloudcode_models import (
     GOOGLE_GEMINI_CLI_ROUTE_ANTIGRAVITY,
     google_gemini_cli_route_from_extra_body,
+    is_antigravity_backend_model,
     resolve_google_gemini_cli_model_alias,
     strip_google_gemini_cli_route_hint,
 )
@@ -950,7 +951,15 @@ class GeminiCloudCodeClient:
         extra_body = strip_google_gemini_cli_route_hint(extra_body)
 
         antigravity_model_enum = resolve_antigravity_cascade_model_enum(model)
-        if route == GOOGLE_GEMINI_CLI_ROUTE_ANTIGRAVITY:
+        if (
+            antigravity_model_enum is None
+            and route == GOOGLE_GEMINI_CLI_ROUTE_ANTIGRAVITY
+            and is_antigravity_backend_model(model)
+        ):
+            # Only honor the private antigravity route hint when alias
+            # resolution produced a genuine curated Antigravity backend enum;
+            # never let a caller-supplied hint reroute an arbitrary model
+            # (e.g. a Cloud Code slug) to Cascade and bypass OAuth/project ctx.
             antigravity_model_enum = model
         if antigravity_model_enum is not None:
             return self._create_antigravity_cascade_completion(

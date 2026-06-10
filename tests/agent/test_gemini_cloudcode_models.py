@@ -47,26 +47,28 @@ class TestPickerIdAlwaysWins:
             "for a different tier is shadowing the picker meaning"
         )
 
-    def test_flash_low_picker_id_is_low_not_medium(self):
-        # Google's raw slug 'gemini-3.5-flash-low' means their Medium preset;
-        # the Hermes picker id 'gemini-3.5-flash-low' must stay Low (M187).
-        backend_model, _extra = resolve_google_gemini_cli_model_alias(
-            "gemini-3.5-flash-low"
-        )
-        assert backend_model == "MODEL_PLACEHOLDER_M187"
-
-    def test_flash_medium_picker_id_resolves_medium(self):
-        backend_model, _extra = resolve_google_gemini_cli_model_alias(
-            "gemini-3.5-flash-medium"
-        )
-        assert backend_model == "MODEL_PLACEHOLDER_M20"
-
-    def test_non_colliding_raw_slug_still_resolves_low(self):
-        # The Low alias's own raw slug keeps working.
-        backend_model, _extra = resolve_google_gemini_cli_model_alias(
+    # Invariant tests for the alias-collision fix (no hardcoded enums, so they
+    # survive catalog refreshes while still catching the shadowing bug): the
+    # Low picker id and its own raw slug must resolve to the SAME backend, and
+    # the Medium tier must resolve to a DIFFERENT one — Google's raw slug
+    # 'gemini-3.5-flash-low' actually means their Medium preset, which must not
+    # shadow the Low picker id.
+    def test_flash_low_and_its_raw_slug_resolve_to_same_backend(self):
+        low, _ = resolve_google_gemini_cli_model_alias("gemini-3.5-flash-low")
+        extra_low, _ = resolve_google_gemini_cli_model_alias(
             "gemini-3.5-flash-extra-low"
         )
-        assert backend_model == "MODEL_PLACEHOLDER_M187"
+        assert low and extra_low, "both Low spellings must resolve to a backend"
+        assert low == extra_low
+
+    def test_flash_medium_does_not_collide_with_low(self):
+        low, _ = resolve_google_gemini_cli_model_alias("gemini-3.5-flash-low")
+        medium, _ = resolve_google_gemini_cli_model_alias("gemini-3.5-flash-medium")
+        assert medium, "Medium picker id must resolve to a backend"
+        assert medium != low, (
+            "the Medium tier must not collide with Low — Google's tier-shifted "
+            "raw slug must lose to the picker meaning"
+        )
 
 
 # =============================================================================

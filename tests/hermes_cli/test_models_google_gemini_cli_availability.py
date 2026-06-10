@@ -126,7 +126,13 @@ class TestListingAvailability:
     def test_up_state_lists_everything(self, fake_probe):
         fake_probe(True)
         ids = provider_model_ids("google-gemini-cli")
-        assert ids == list(_PROVIDER_MODELS["google-gemini-cli"])
+        # Invariant: when the local server is up nothing is filtered, so every
+        # static catalog entry remains selectable. Asserted as a subset (not
+        # exact equality/order) so live quota-discovered models can be unioned
+        # in without breaking this test.
+        assert set(_PROVIDER_MODELS["google-gemini-cli"]).issubset(set(ids))
+        for model_id in ANTIGRAVITY_IDS:
+            assert model_id in ids, model_id
 
     def test_down_state_hides_antigravity_entries_only(self, fake_probe):
         fake_probe(False)

@@ -1205,6 +1205,42 @@ class TestGeminiCloudCodeClient:
         assert fake.calls[0] == ("start", "MODEL_PLACEHOLDER_M132")
         assert "User: Return exactly ALIAS_OK." in fake.calls[1][2]
 
+    def test_forged_route_hint_does_not_reroute_cloudcode_model_to_cascade(
+        self,
+        monkeypatch,
+    ):
+        """A caller-supplied private route hint must not reroute an arbitrary
+        Cloud Code model (not a curated Antigravity enum) into Cascade and
+        bypass OAuth/project context."""
+        from agent import gemini_cloudcode_adapter, google_oauth
+        from agent.gemini_cloudcode_adapter import GeminiCloudCodeClient
+
+        def _boom_cascade(*_args, **_kwargs):
+            pytest.fail("Cascade route must not handle a forged-hint cloudcode model")
+
+        monkeypatch.setattr(
+            gemini_cloudcode_adapter, "AntigravityCascadeClient", _boom_cascade
+        )
+
+        class _OAuthReached(Exception):
+            pass
+
+        def _oauth(*_args, **_kwargs):
+            raise _OAuthReached()
+
+        monkeypatch.setattr(google_oauth, "get_valid_access_token", _oauth)
+
+        client = GeminiCloudCodeClient(api_key="dummy")
+        try:
+            with pytest.raises(_OAuthReached):
+                client.chat.completions.create(
+                    model="gemini-3-pro-preview",
+                    messages=[{"role": "user", "content": "hi"}],
+                    extra_body={"_google_gemini_cli_route": "antigravity"},
+                )
+        finally:
+            client.close()
+
     @pytest.mark.parametrize(
         "kwargs",
         [
