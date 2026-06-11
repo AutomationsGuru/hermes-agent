@@ -138,3 +138,55 @@ class TestSanitizeGeminiToolParameters:
         assert "1440" in aad["description"]
         # And the string-enum sibling is untouched.
         assert cleaned["properties"]["action"]["enum"] == ["create_thread"]
+
+
+class TestProtobufValidationHardening:
+    """Fixes adapted from opencode-antigravity-auth (MIT) for Code Assist errors."""
+
+    def test_required_filtered_to_existing_properties(self):
+        # "parameters.required[X]: property X is not defined" — a required entry
+        # that names no real property must be dropped.
+        cleaned = sanitize_gemini_tool_parameters({
+            "type": "object",
+            "properties": {"city": {"type": "string"}},
+            "required": ["city", "ghost"],
+        })
+        assert cleaned["required"] == ["city"]
+
+    def test_required_dropped_when_no_properties_match(self):
+        cleaned = sanitize_gemini_tool_parameters({
+            "type": "object",
+            "properties": {},
+            "required": ["ghost"],
+        })
+        assert "required" not in cleaned
+
+    def test_array_without_items_gets_default(self):
+        # "parameters.properties[X].items: missing field" — arrays need items.
+        cleaned = sanitize_gemini_tool_parameters({
+            "type": "object",
+            "properties": {"tags": {"type": "array"}},
+        })
+        assert cleaned["properties"]["tags"]["items"] == {"type": "string"}
+
+    def test_array_with_items_is_preserved(self):
+        cleaned = sanitize_gemini_tool_parameters({
+            "type": "object",
+            "properties": {"ids": {"type": "array", "items": {"type": "integer"}}},
+        })
+        assert cleaned["properties"]["ids"]["items"] == {"type": "integer"}
+
+    def test_required_filter_applies_to_nested_objects(self):
+        cleaned = sanitize_gemini_tool_parameters({
+            "type": "object",
+            "properties": {
+                "filter": {
+                    "type": "object",
+                    "properties": {"q": {"type": "string"}},
+                    "required": ["q", "missing"],
+                },
+            },
+            "required": ["filter"],
+        })
+        assert cleaned["properties"]["filter"]["required"] == ["q"]
+        assert cleaned["required"] == ["filter"]
