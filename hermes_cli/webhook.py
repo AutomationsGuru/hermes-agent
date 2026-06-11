@@ -81,13 +81,21 @@ def _save_subscriptions(subs: Dict[str, dict]) -> None:
 
 
 def _get_webhook_config() -> dict:
-    """Load webhook platform config. Returns {} if not configured."""
+    """Load effective webhook platform config. Returns {} if not configured."""
     try:
-        from hermes_cli.config import load_config
-        cfg = load_config()
-        return cfg_get(cfg, "platforms", "webhook", default={})
+        from gateway.config import Platform, load_gateway_config
+
+        cfg = load_gateway_config()
+        platform_config = cfg.platforms.get(Platform.WEBHOOK)
+        return platform_config.to_dict() if platform_config else {}
     except Exception:
-        return {}
+        try:
+            from hermes_cli.config import load_config
+
+            cfg = load_config()
+            return cfg_get(cfg, "platforms", "webhook", default={})
+        except Exception:
+            return {}
 
 
 def _is_webhook_enabled() -> bool:
@@ -121,6 +129,7 @@ def _setup_hint() -> str:
 
   3. Or set environment variables in {_dhh}/.env:
      WEBHOOK_ENABLED=true
+     WEBHOOK_HOST=0.0.0.0
      WEBHOOK_PORT=8644
      WEBHOOK_SECRET=your-global-secret
 

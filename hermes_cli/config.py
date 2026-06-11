@@ -2182,6 +2182,15 @@ DEFAULT_CONFIG = {
         "force_ipv4": False,
     },
 
+    # Native MCP client startup behavior.
+    "mcp": {
+        # Bounded wait before the first tool snapshot/banner while background
+        # MCP discovery is still connecting. Keep low by default so dead MCP
+        # servers cannot make the terminal feel hung; increase per profile for
+        # large-but-healthy MCP servers that need more time to list tools.
+        "startup_discovery_wait_timeout": 0.75,
+    },
+
     # Gateway settings — control how messaging platforms (Telegram, Discord,
     # Slack, etc.) deliver agent-produced files as native attachments.
     "gateway": {
@@ -3503,6 +3512,14 @@ OPTIONAL_ENV_VARS = {
         "url": None,
         "password": False,
         "category": "messaging",
+    },
+    "WEBHOOK_HOST": {
+        "description": "Bind host for the webhook HTTP server (default: 0.0.0.0).",
+        "prompt": "Webhook bind host",
+        "url": None,
+        "password": False,
+        "category": "messaging",
+        "advanced": True,
     },
     "WEBHOOK_PORT": {
         "description": "Port for the webhook HTTP server (default: 8644).",

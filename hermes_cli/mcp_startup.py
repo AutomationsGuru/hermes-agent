@@ -2,12 +2,44 @@
 
 from __future__ import annotations
 
+import os
 import threading
 from typing import Optional
+
+_DEFAULT_DISCOVERY_WAIT_TIMEOUT = 0.75
+_DISCOVERY_WAIT_ENV = "HERMES_MCP_DISCOVERY_WAIT_TIMEOUT"
 
 _mcp_discovery_lock = threading.Lock()
 _mcp_discovery_started = False
 _mcp_discovery_thread: Optional[threading.Thread] = None
+
+
+def get_mcp_discovery_wait_timeout(default: float = _DEFAULT_DISCOVERY_WAIT_TIMEOUT) -> float:
+    """Return the bounded startup wait for background MCP discovery.
+
+    Discovery itself still happens in a daemon thread so a dead MCP server cannot
+    freeze the terminal.  This value only controls how long the CLI/TUI waits
+    before the first tool snapshot/banner so slow-but-healthy servers have time
+    to register instead of being shown as failed.
+    """
+    raw = os.getenv(_DISCOVERY_WAIT_ENV, "").strip()
+    if not raw:
+        try:
+            from hermes_cli.config import read_raw_config
+
+            cfg = read_raw_config() or {}
+            mcp_cfg = cfg.get("mcp") if isinstance(cfg, dict) else None
+            if isinstance(mcp_cfg, dict):
+                raw = str(mcp_cfg.get("startup_discovery_wait_timeout", "")).strip()
+        except Exception:
+            raw = ""
+
+    if not raw:
+        return default
+    try:
+        return max(0.0, float(raw))
+    except (TypeError, ValueError):
+        return default
 
 
 def _has_configured_mcp_servers() -> bool:
@@ -51,9 +83,11 @@ def start_background_mcp_discovery(*, logger, thread_name: str) -> None:
         thread.start()
 
 
-def wait_for_mcp_discovery(timeout: float = 0.75) -> None:
+def wait_for_mcp_discovery(timeout: Optional[float] = None) -> None:
     """Briefly wait for background MCP discovery before the first tool snapshot."""
     thread = _mcp_discovery_thread
     if thread is None or not thread.is_alive():
         return
+    if timeout is None:
+        timeout = get_mcp_discovery_wait_timeout()
     thread.join(timeout=timeout)

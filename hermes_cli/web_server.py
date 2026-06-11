@@ -3032,7 +3032,7 @@ _PLATFORM_OVERRIDES: dict[str, dict[str, Any]] = {
         "name": "Webhooks",
         "description": "Receive events from GitHub, GitLab, and other webhook sources.",
         "docs_url": "https://hermes-agent.nousresearch.com/docs/user-guide/messaging/webhooks/",
-        "env_vars": ("WEBHOOK_ENABLED", "WEBHOOK_PORT", "WEBHOOK_SECRET"),
+        "env_vars": ("WEBHOOK_ENABLED", "WEBHOOK_HOST", "WEBHOOK_PORT", "WEBHOOK_SECRET"),
         "required_env": (),
     },
 }

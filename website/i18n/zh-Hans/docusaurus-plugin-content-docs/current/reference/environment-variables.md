@@ -402,6 +402,7 @@ description: "Hermes Agent 使用的所有环境变量完整参考"
 | `HASS_TOKEN` | Home Assistant 长期访问 token（启用 HA 平台 + 工具） |
 | `HASS_URL` | Home Assistant URL（默认：`http://homeassistant.local:8123`） |
 | `WEBHOOK_ENABLED` | 启用 webhook 平台适配器（`true`/`false`） |
+| `WEBHOOK_HOST` | webhook HTTP 服务器绑定主机（默认：`0.0.0.0`） |
 | `WEBHOOK_PORT` | 接收 webhook 的 HTTP 服务器端口（默认：`8644`） |
 | `WEBHOOK_SECRET` | webhook 签名验证的全局 HMAC 密钥（当路由未指定自己的密钥时作为回退） |
 | `API_SERVER_ENABLED` | 启用 OpenAI 兼容 API 服务器（`true`/`false`）。与其他平台并行运行。 |

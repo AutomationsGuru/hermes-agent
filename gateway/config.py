@@ -1589,13 +1589,28 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
             config.platforms[Platform.API_SERVER].extra["model_name"] = api_server_model_name
 
     # Webhook platform
-    webhook_enabled = os.getenv("WEBHOOK_ENABLED", "").lower() in {"true", "1", "yes"}
+    webhook_enabled_raw = os.getenv("WEBHOOK_ENABLED", "").strip().lower()
+    webhook_enabled = webhook_enabled_raw in {"true", "1", "yes", "on"}
+    webhook_disabled = webhook_enabled_raw in {"false", "0", "no", "off"}
+    webhook_host = os.getenv("WEBHOOK_HOST")
     webhook_port = os.getenv("WEBHOOK_PORT")
     webhook_secret = os.getenv("WEBHOOK_SECRET", "")
-    if webhook_enabled:
+    if (
+        webhook_enabled
+        or webhook_disabled
+        or Platform.WEBHOOK in config.platforms
+        or webhook_host
+        or webhook_port
+        or webhook_secret
+    ):
         if Platform.WEBHOOK not in config.platforms:
             config.platforms[Platform.WEBHOOK] = PlatformConfig()
-        config.platforms[Platform.WEBHOOK].enabled = True
+        if webhook_enabled:
+            config.platforms[Platform.WEBHOOK].enabled = True
+        elif webhook_disabled:
+            config.platforms[Platform.WEBHOOK].enabled = False
+        if webhook_host:
+            config.platforms[Platform.WEBHOOK].extra["host"] = webhook_host
         if webhook_port:
             try:
                 config.platforms[Platform.WEBHOOK].extra["port"] = int(webhook_port)

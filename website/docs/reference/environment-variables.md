@@ -409,6 +409,7 @@ For cloud sandbox backends, persistence is filesystem-oriented. `TERMINAL_LIFETI
 | `HASS_TOKEN` | Home Assistant Long-Lived Access Token (enables HA platform + tools) |
 | `HASS_URL` | Home Assistant URL (default: `http://homeassistant.local:8123`) |
 | `WEBHOOK_ENABLED` | Enable the webhook platform adapter (`true`/`false`) |
+| `WEBHOOK_HOST` | Bind host for the webhook HTTP server (default: `0.0.0.0`) |
 | `WEBHOOK_PORT` | HTTP server port for receiving webhooks (default: `8644`) |
 | `WEBHOOK_SECRET` | Global HMAC secret for webhook signature validation (used as fallback when routes don't specify their own) |
 | `API_SERVER_ENABLED` | Enable the OpenAI-compatible API server (`true`/`false`). Runs alongside other platforms. |

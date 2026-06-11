@@ -192,7 +192,7 @@ def _log_exit(reason: str) -> None:
     print(f"[gateway-exit] {reason}", file=sys.stderr, flush=True)
 
 
-def wait_for_mcp_discovery(timeout: float = 0.75) -> None:
+def wait_for_mcp_discovery(timeout: float | None = None) -> None:
     """Briefly block until background MCP discovery finishes, up to ``timeout``.
 
     MCP discovery runs in a daemon thread spawned at startup (see main()) so a
@@ -207,6 +207,13 @@ def wait_for_mcp_discovery(timeout: float = 0.75) -> None:
     thread = _mcp_discovery_thread
     if thread is None or not thread.is_alive():
         return
+    if timeout is None:
+        try:
+            from hermes_cli.mcp_startup import get_mcp_discovery_wait_timeout
+
+            timeout = get_mcp_discovery_wait_timeout()
+        except Exception:
+            timeout = 0.75
     thread.join(timeout=timeout)
 
 

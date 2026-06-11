@@ -588,7 +588,7 @@ For the full design — comparison with Cline Kanban / Paperclip / NanoClaw / Ge
 hermes webhook <subscribe|list|remove|test>
 ```
 
-Manage dynamic webhook subscriptions for event-driven agent activation. Requires the webhook platform to be enabled in config — if not configured, prints setup instructions.
+Manage dynamic webhook subscriptions for event-driven agent activation. Requires the webhook platform to be enabled in config or via `WEBHOOK_ENABLED=true` — if not configured, prints setup instructions.
 
 | Subcommand | Description |
 |------------|-------------|

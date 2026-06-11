@@ -50,6 +50,7 @@ Add to `~/.hermes/.env`:
 
 ```bash
 WEBHOOK_ENABLED=true
+WEBHOOK_HOST=0.0.0.0   # default bind host
 WEBHOOK_PORT=8644        # default
 WEBHOOK_SECRET=your-global-secret
 ```
@@ -480,5 +481,6 @@ Webhook payloads contain attacker-controlled data — PR titles, commit messages
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `WEBHOOK_ENABLED` | Enable the webhook platform adapter | `false` |
+| `WEBHOOK_HOST` | Bind host for the webhook HTTP server | `0.0.0.0` |
 | `WEBHOOK_PORT` | HTTP server port for receiving webhooks | `8644` |
 | `WEBHOOK_SECRET` | Global HMAC secret (used as fallback when routes don't specify their own) | _(none)_ |

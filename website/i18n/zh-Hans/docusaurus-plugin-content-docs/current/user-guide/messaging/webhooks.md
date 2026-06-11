@@ -50,6 +50,7 @@ hermes gateway setup
 
 ```bash
 WEBHOOK_ENABLED=true
+WEBHOOK_HOST=0.0.0.0   # 默认绑定主机
 WEBHOOK_PORT=8644        # default
 WEBHOOK_SECRET=your-global-secret
 ```
@@ -480,5 +481,6 @@ Webhook payload 包含攻击者可控的数据——PR 标题、commit 消息、
 | 变量 | 描述 | 默认值 |
 |----------|-------------|---------|
 | `WEBHOOK_ENABLED` | 启用 webhook 平台适配器 | `false` |
+| `WEBHOOK_HOST` | webhook HTTP 服务器绑定主机 | `0.0.0.0` |
 | `WEBHOOK_PORT` | 接收 webhook 的 HTTP 服务器端口 | `8644` |
 | `WEBHOOK_SECRET` | 全局 HMAC secret（路由未指定自身 secret 时作为回退） | _（无）_ |

@@ -452,7 +452,7 @@ hermes kanban boards rm atm10-server --delete
 hermes webhook <subscribe|list|remove|test>
 ```
 
-管理用于事件驱动 agent 激活的动态 webhook 订阅。需要在 config 中启用 webhook 平台——如未配置，将打印设置说明。
+管理用于事件驱动 agent 激活的动态 webhook 订阅。需要在 config 中启用 webhook 平台，或设置 `WEBHOOK_ENABLED=true`；如未配置，将打印设置说明。
 
 | 子命令 | 说明 |
 |------------|-------------|
