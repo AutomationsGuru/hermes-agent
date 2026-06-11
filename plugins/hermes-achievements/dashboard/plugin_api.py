@@ -12,6 +12,8 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
 
+from utils import atomic_json_write, cross_process_file_lock
+
 try:
     from hermes_constants import get_hermes_home
 except ImportError:
@@ -154,6 +156,10 @@ def checkpoint_path() -> Path:
     return get_hermes_home() / "plugins" / "hermes-achievements" / "scan_checkpoint.json"
 
 
+def sidecar_lock_path(path: Path) -> Path:
+    return path.with_name(f"{path.name}.lock")
+
+
 def load_state() -> Dict[str, Any]:
     path = state_path()
     if not path.exists():
@@ -167,7 +173,8 @@ def load_state() -> Dict[str, Any]:
 def save_state(state: Dict[str, Any]) -> None:
     path = state_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(state, indent=2, sort_keys=True))
+    with cross_process_file_lock(sidecar_lock_path(path)):
+        atomic_json_write(path, state, indent=2, sort_keys=True)
 
 
 def _json_safe(value: Any) -> Any:
@@ -196,7 +203,8 @@ def load_snapshot() -> Optional[Dict[str, Any]]:
 def save_snapshot(data: Dict[str, Any]) -> None:
     path = snapshot_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(_json_safe(data), indent=2, sort_keys=True))
+    with cross_process_file_lock(sidecar_lock_path(path)):
+        atomic_json_write(path, _json_safe(data), indent=2, sort_keys=True)
 
 
 def load_checkpoint() -> Dict[str, Any]:
@@ -219,7 +227,8 @@ def load_checkpoint() -> Dict[str, Any]:
 def save_checkpoint(data: Dict[str, Any]) -> None:
     path = checkpoint_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(_json_safe(data), indent=2, sort_keys=True))
+    with cross_process_file_lock(sidecar_lock_path(path)):
+        atomic_json_write(path, _json_safe(data), indent=2, sort_keys=True)
 
 
 def session_fingerprint(meta: Dict[str, Any]) -> Dict[str, Any]:

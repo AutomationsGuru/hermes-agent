@@ -25,6 +25,7 @@ import sys
 import tempfile
 import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Any, Optional, List, Tuple
@@ -236,6 +237,7 @@ _RAW_CONFIG_CACHE: Dict[str, Tuple[int, int, Dict[str, Any]]] = {}
 # calls read_raw_config. Also covers mutation of the module-level cache
 # dicts above.
 _CONFIG_LOCK = threading.RLock()
+_CONFIG_FILE_LOCK_TIMEOUT_SECONDS = 15.0
 # Env var names written to .env that aren't in OPTIONAL_ENV_VARS
 # (managed by setup/provider flows directly).
 _EXTRA_ENV_KEYS = frozenset({
@@ -590,7 +592,7 @@ def get_container_exec_info() -> Optional[dict]:
 
 # Re-export from hermes_constants — canonical definition lives there.
 from hermes_constants import get_hermes_home  # noqa: F811,E402
-from utils import atomic_replace
+from utils import atomic_replace, cross_process_file_lock
 
 def get_config_path() -> Path:
     """Get the main config file path."""
@@ -599,6 +601,37 @@ def get_config_path() -> Path:
 def get_env_path() -> Path:
     """Get the .env file path (for API keys)."""
     return get_hermes_home() / ".env"
+
+
+def _config_store_lock_path(config_path: Optional[Path] = None) -> Path:
+    path = config_path or get_config_path()
+    return path.with_name(f"{path.name}.lock")
+
+
+@contextmanager
+def config_store_lock(
+    config_path: Optional[Path] = None,
+    *,
+    timeout_seconds: float = _CONFIG_FILE_LOCK_TIMEOUT_SECONDS,
+):
+    """Serialize config.yaml read-modify-write transactions across processes."""
+    with _CONFIG_LOCK:
+        lock_path = _config_store_lock_path(config_path)
+        with cross_process_file_lock(
+            lock_path,
+            timeout_seconds=timeout_seconds,
+            timeout_message=f"Timed out waiting for config store lock: {lock_path}",
+        ):
+            yield
+
+
+def invalidate_config_caches(config_path: Optional[Path] = None) -> None:
+    """Drop in-process config caches after direct config-file writes."""
+    with _CONFIG_LOCK:
+        path_key = str(config_path or get_config_path())
+        _LOAD_CONFIG_CACHE.pop(path_key, None)
+        _RAW_CONFIG_CACHE.pop(path_key, None)
+        _LAST_EXPANDED_CONFIG_BY_PATH.pop(path_key, None)
 
 def get_project_root() -> Path:
     """Get the project installation directory."""
@@ -5377,10 +5410,10 @@ _COMMENTED_SECTIONS = """
 
 def save_config(config: Dict[str, Any]):
     """Save configuration to ~/.hermes/config.yaml."""
-    with _CONFIG_LOCK:
-        if is_managed():
-            managed_error("save configuration")
-            return
+    if is_managed():
+        managed_error("save configuration")
+        return
+    with config_store_lock():
         from utils import atomic_yaml_write
 
         ensure_hermes_home()
@@ -5416,6 +5449,7 @@ def save_config(config: Dict[str, Any]):
             extra_content="".join(parts) if parts else None,
         )
         _secure_file(config_path)
+        invalidate_config_caches(config_path)
         _LAST_EXPANDED_CONFIG_BY_PATH[str(config_path)] = copy.deepcopy(current_normalized)
 
 
@@ -6093,39 +6127,43 @@ def set_config_value(key: str, value: str):
         print(f"✓ Set {key} in {get_env_path()}")
         return
     
-    # Otherwise it goes to config.yaml
-    # Read the raw user config (not merged with defaults) to avoid
-    # dumping all default values back to the file
-    config_path = get_config_path()
-    user_config = {}
-    if config_path.exists():
-        try:
-            with open(config_path, encoding="utf-8") as f:
-                user_config = yaml.safe_load(f) or {}
-        except Exception:
-            user_config = {}
-    
-    # Handle nested keys (e.g., "tts.provider") including numeric list
-    # indices (e.g., "custom_providers.0.api_key").  Delegates to
-    # _set_nested which preserves list-typed nodes; before #17876 the
-    # inline navigation here silently overwrote lists with dicts.
+    # Otherwise it goes to config.yaml. Hold the cross-process config lock
+    # across raw read, mutation, and atomic write to avoid lost updates from
+    # sibling Hermes/admin processes.
+    with config_store_lock():
+        # Read the raw user config (not merged with defaults) to avoid
+        # dumping all default values back to the file
+        config_path = get_config_path()
+        user_config = {}
+        if config_path.exists():
+            try:
+                with open(config_path, encoding="utf-8") as f:
+                    user_config = yaml.safe_load(f) or {}
+            except Exception:
+                user_config = {}
 
-    # Convert value to appropriate type
-    if value.lower() in {'true', 'yes', 'on'}:
-        value = True
-    elif value.lower() in {'false', 'no', 'off'}:
-        value = False
-    elif value.isdigit():
-        value = int(value)
-    elif value.replace('.', '', 1).isdigit():
-        value = float(value)
+        # Handle nested keys (e.g., "tts.provider") including numeric list
+        # indices (e.g., "custom_providers.0.api_key").  Delegates to
+        # _set_nested which preserves list-typed nodes; before #17876 the
+        # inline navigation here silently overwrote lists with dicts.
 
-    _set_nested(user_config, key, value)
-    
-    # Write only user config back (not the full merged defaults)
-    ensure_hermes_home()
-    from utils import atomic_yaml_write
-    atomic_yaml_write(config_path, user_config, sort_keys=False)
+        # Convert value to appropriate type
+        if value.lower() in {'true', 'yes', 'on'}:
+            value = True
+        elif value.lower() in {'false', 'no', 'off'}:
+            value = False
+        elif value.isdigit():
+            value = int(value)
+        elif value.replace('.', '', 1).isdigit():
+            value = float(value)
+
+        _set_nested(user_config, key, value)
+
+        # Write only user config back (not the full merged defaults)
+        ensure_hermes_home()
+        from utils import atomic_yaml_write
+        atomic_yaml_write(config_path, user_config, sort_keys=False)
+        invalidate_config_caches(config_path)
     
     # Keep .env in sync for keys that terminal_tool reads directly from env vars.
     # config.yaml is authoritative, but terminal_tool only reads TERMINAL_ENV etc.

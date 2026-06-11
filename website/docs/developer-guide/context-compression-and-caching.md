@@ -371,6 +371,35 @@ The CLI shows caching status at startup:
 ```
 
 
+## Session Store at the Compression Boundary
+
+Compression is not purely in-memory. When a session store is active, a
+successful compaction also splits the DB session:
+
+1. The current session row is ended with `end_reason="compression"`.
+2. A continuation row is created with `parent_session_id` set to the old id,
+   and the title auto-numbers (`My Task` → `My Task #2`).
+3. The agent's DB flush cursor is reset and the rotation is flagged
+   **immediately after the id swap, before any fallible DB call** — so a
+   transient SQLite failure mid-split cannot strand the continuation row
+   without its transcript.
+4. The compressed message list is persisted to the continuation row on the
+   next flush; the flush cursor is scoped by session id, so stale
+   pre-compression history in a finalizer cannot suppress the writes.
+5. The active context engine is notified via
+   `on_session_start(new_sid, boundary_reason="compression",
+   old_session_id=old_sid, conversation_id=...)` so plugin engines preserve
+   continuity — engine `on_session_start` implementations must accept
+   `**kwargs` (see
+   [Context Engine Plugin](./context-engine-plugin.md#compression-boundaries)).
+
+Historically, a violation of (4) produced *accounting-only* continuation
+rows — `api_call_count`/token counters but zero persisted messages — which
+leaked into session lists as empty entries. List/search surfaces now resolve
+chains to the newest *message-bearing* segment for user-facing reads (see
+[Session Storage](./session-storage.md#session-lineage)), and
+`scripts/audit_empty_sessions.py` audits/quarantines any legacy rows.
+
 ## Context Pressure Warnings
 
 Intermediate context-pressure warnings have been removed (see the iteration-budget block in `run_agent.py`, which notes: "No intermediate pressure warnings — they caused models to 'give up' prematurely on complex tasks"). Compression fires when prompt tokens reach the configured `compression.threshold` (default 50%) with no prior warning step; gateway session hygiene fires as the secondary safety net at 85% of the model's context window.

@@ -35,6 +35,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 from hermes_constants import get_hermes_home
 from agent.skill_utils import is_excluded_skill_path
+from utils import cross_process_file_lock
 
 logger = logging.getLogger(__name__)
 
@@ -264,6 +265,18 @@ def _suppressed_file() -> Path:
     return _skills_dir() / ".curator_suppressed"
 
 
+@contextmanager
+def _suppressed_file_lock():
+    """Serialize .curator_suppressed read-modify-write cycles."""
+    path = _suppressed_file()
+    lock_path = Path(str(path) + ".lock")
+    with cross_process_file_lock(
+        lock_path,
+        timeout_message=f"Timed out waiting for curator suppression lock: {lock_path}",
+    ):
+        yield
+
+
 def read_suppressed_names() -> Set[str]:
     """Built-in skills the curator pruned — the re-seeder must leave archived.
 
@@ -311,20 +324,22 @@ def add_suppressed_name(skill_name: str) -> None:
     """Record that a built-in skill was pruned, so sync won't restore it."""
     if not skill_name:
         return
-    names = read_suppressed_names()
-    if skill_name not in names:
-        names.add(skill_name)
-        _write_suppressed_names(names)
+    with _suppressed_file_lock():
+        names = read_suppressed_names()
+        if skill_name not in names:
+            names.add(skill_name)
+            _write_suppressed_names(names)
 
 
 def remove_suppressed_name(skill_name: str) -> None:
     """Clear a built-in's suppression entry (e.g. on restore)."""
     if not skill_name:
         return
-    names = read_suppressed_names()
-    if skill_name in names:
-        names.discard(skill_name)
-        _write_suppressed_names(names)
+    with _suppressed_file_lock():
+        names = read_suppressed_names()
+        if skill_name in names:
+            names.discard(skill_name)
+            _write_suppressed_names(names)
 
 
 def list_agent_created_skill_names() -> List[str]:

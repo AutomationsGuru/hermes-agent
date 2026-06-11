@@ -13,6 +13,7 @@ this from a real user-initiated /new.
 
 import os
 import tempfile
+from contextlib import closing
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -36,8 +37,12 @@ class TestCompressionBoundaryHook:
     def test_on_session_start_called_with_compression_boundary(self):
         from hermes_state import SessionDB
 
-        with tempfile.TemporaryDirectory() as tmpdir:
-            db = SessionDB(db_path=Path(tmpdir) / "test.db")
+        # closing() releases the SQLite handle BEFORE TemporaryDirectory
+        # cleanup — an open handle makes the unlink fail with WinError 32
+        # on Windows.
+        with tempfile.TemporaryDirectory() as tmpdir, closing(
+            SessionDB(db_path=Path(tmpdir) / "test.db")
+        ) as db:
             agent = self._make_agent(db)
 
             # Stub the context compressor: we only need to observe the hook.
@@ -131,8 +136,9 @@ class TestCompressionBoundaryHook:
         """If the context engine raises from on_session_start, compression still completes."""
         from hermes_state import SessionDB
 
-        with tempfile.TemporaryDirectory() as tmpdir:
-            db = SessionDB(db_path=Path(tmpdir) / "test.db")
+        with tempfile.TemporaryDirectory() as tmpdir, closing(
+            SessionDB(db_path=Path(tmpdir) / "test.db")
+        ) as db:
             agent = self._make_agent(db)
 
             compressor = MagicMock()

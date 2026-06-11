@@ -2041,8 +2041,37 @@ async def search_sessions(q: str = "", limit: int = 20):
             tip_cache: dict = {}
 
             def lineage_tip(root_id: str) -> str:
+                """Resolve the session id a search hit should OPEN.
+
+                Prefer the newest chain segment that actually has message
+                rows: compression can leave accounting-only continuation
+                rows (api_call/token counters, zero messages — see #15000),
+                and pointing the result at one of those gives the user an
+                empty transcript even though FTS matched real content in an
+                older segment. Fall back to the structural tip only when no
+                segment has messages.
+                """
                 if root_id in tip_cache:
                     return tip_cache[root_id]
+                tip = root_id
+                try:
+                    bearing = db.get_message_bearing_tip(root_id)
+                    if bearing:
+                        tip = bearing
+                    else:
+                        resolved = db.get_compression_tip(root_id)
+                        if resolved:
+                            tip = resolved
+                except Exception:
+                    pass
+                tip_cache[root_id] = tip
+                return tip
+
+            structural_tip_cache: dict = {}
+
+            def structural_tip(root_id: str) -> str:
+                if root_id in structural_tip_cache:
+                    return structural_tip_cache[root_id]
                 tip = root_id
                 try:
                     resolved = db.get_compression_tip(root_id)
@@ -2050,7 +2079,7 @@ async def search_sessions(q: str = "", limit: int = 20):
                         tip = resolved
                 except Exception:
                     pass
-                tip_cache[root_id] = tip
+                structural_tip_cache[root_id] = tip
                 return tip
 
             # Both ID matches and content matches share one keyspace, keyed by
@@ -2068,6 +2097,7 @@ async def search_sessions(q: str = "", limit: int = 20):
                 payload = dict(payload)
                 payload["session_id"] = lineage_tip(root)
                 payload["lineage_root"] = root
+                payload["structural_tip"] = structural_tip(root)
                 seen[root] = payload
 
             # Direct ID matches first: users often paste a session id from CLI,

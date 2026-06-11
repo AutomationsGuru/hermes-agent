@@ -888,7 +888,9 @@ Lines without a parseable timestamp are included when `--since` is active (they 
 
 ### Log rotation
 
-Hermes uses Python's `RotatingFileHandler`. Old logs are rotated automatically — look for `agent.log.1`, `agent.log.2`, etc. The `hermes logs list` subcommand shows all log files including rotated ones.
+Hermes rotates logs automatically at the configured size threshold — look for `agent.log.1`, `agent.log.2`, etc. The `hermes logs list` subcommand shows all log files including rotated ones.
+
+Rotation is safe with multiple Hermes processes writing the same log file: rollover is serialized by a cross-process lock (`<log>.rollover.lock`), and on Windows the live file is **copied to the backup slot and truncated in place** instead of renamed — renaming a log another process holds open fails with `WinError 32`. A failed rollover never breaks logging; the handler keeps writing and retries on a later emit.
 
 
 ## `hermes prompt-size`

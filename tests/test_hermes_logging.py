@@ -239,6 +239,28 @@ class TestSetupLogging:
         record = factory("test", logging.INFO, "", 0, "msg", (), None)
         assert hasattr(record, "session_tag")
 
+    def test_windows_rollover_copies_backup_and_truncates_live_log(self, tmp_path, monkeypatch):
+        """Windows rollover must not rename the live log while peers hold it."""
+        monkeypatch.setattr(hermes_logging, "_is_windows", lambda: True)
+        log_path = tmp_path / "agent.log"
+        original = "x" * 64
+        log_path.write_text(original, encoding="utf-8")
+
+        handler = hermes_logging._ManagedRotatingFileHandler(
+            str(log_path),
+            maxBytes=32,
+            backupCount=2,
+            encoding="utf-8",
+        )
+        try:
+            handler.doRollover()
+        finally:
+            handler.close()
+
+        assert log_path.read_text(encoding="utf-8") == ""
+        assert (tmp_path / "agent.log.1").read_text(encoding="utf-8") == original
+        assert (tmp_path / "agent.log.rollover.lock").exists()
+
 
 class TestGatewayMode:
     """setup_logging(mode='gateway') creates a filtered gateway.log."""

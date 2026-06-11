@@ -7,6 +7,7 @@ tests run fully offline and the curator module doesn't need real credentials.
 from __future__ import annotations
 
 import importlib
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -388,6 +389,28 @@ def test_prune_builtins_restore_clears_suppression(curator_env, monkeypatch):
     assert ok
     assert (skills_dir / "bundled").exists()
     assert "bundled" not in u.read_suppressed_names()
+
+
+def test_suppressed_name_updates_use_cross_process_lock(curator_env, monkeypatch):
+    u = curator_env["usage"]
+    calls = []
+    real_lock = u.cross_process_file_lock
+
+    @contextmanager
+    def spy_lock(path, **kwargs):
+        calls.append(Path(path).name)
+        with real_lock(path, **kwargs):
+            yield
+
+    monkeypatch.setattr(u, "cross_process_file_lock", spy_lock)
+
+    u.add_suppressed_name("bundled")
+    assert "bundled" in u.read_suppressed_names()
+    u.remove_suppressed_name("bundled")
+    assert "bundled" not in u.read_suppressed_names()
+
+    assert calls == [".curator_suppressed.lock", ".curator_suppressed.lock"]
+    assert (curator_env["home"] / "skills" / ".curator_suppressed.lock").exists()
 
 
 def test_protected_builtin_never_archived_even_when_stale(curator_env, monkeypatch):

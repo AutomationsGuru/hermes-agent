@@ -210,6 +210,10 @@ The fallback system also covers auxiliary tasks independently — vision, compre
 3. The last N messages are preserved intact (`compression.protect_last_n`, default: 20)
 4. Tool call/result message pairs are kept together (never split)
 5. A new session lineage ID is generated (compression creates a "child" session)
+6. The compressed transcript is persisted to the new child session row — the
+   DB flush cursor is scoped by session id, so a stale pre-compression
+   history can never suppress the child's writes (the old failure mode left
+   "accounting-only" rows: token counters but zero messages)
 
 ### Session Persistence
 

@@ -89,7 +89,7 @@ These have sensible defaults in the ABC. Override as needed:
 
 | Method | Default | Override when |
 |--------|---------|--------------|
-| `on_session_start(session_id, **kwargs)` | No-op | You need to load persisted state (DAG, DB) |
+| `on_session_start(session_id, **kwargs)` | No-op | You need to load persisted state (DAG, DB). See [Compression boundaries](#compression-boundaries) for the kwargs the host sends on a compression split |
 | `on_session_end(session_id, messages)` | No-op | You need to flush state, close connections |
 | `on_session_reset()` | Resets token counters | You have per-session state to clear |
 | `update_model(model, context_length, ...)` | Updates context_length + threshold | You need to recalculate budgets on model switch |
@@ -155,6 +155,56 @@ Only one engine can be registered. A second plugin attempting to register is rej
 ```
 
 `on_session_reset()` is called on `/new` or `/reset` to clear per-session state without a full shutdown.
+
+### Compression boundaries
+
+When a session store is active, a successful `compress()` does not just shrink
+the in-memory list — the host also **rotates the session id**: the old session
+row is ended with `end_reason="compression"` and a new continuation row is
+created with `parent_session_id` pointing at the old one. The host then
+re-fires `on_session_start` with kwargs that let your engine preserve
+continuity across the split instead of treating it as a fresh `/new`:
+
+```python
+on_session_start(
+    new_session_id,
+    boundary_reason="compression",
+    old_session_id=old_session_id,
+    conversation_id=...,   # gateway session key, when one exists
+)
+```
+
+Your `on_session_start` MUST accept `**kwargs` (as the ABC signature shows):
+the host passes additional kwargs here and at init time (`hermes_home`,
+`platform`, `model`, `context_length`, `conversation_id`), and a strict
+signature raises a `TypeError` that the host swallows — your engine would
+silently miss the notification.
+
+Engines that key persisted state (a DAG, a DB) to the session id should treat
+a `boundary_reason="compression"` call as a *continuation* of
+`old_session_id`, not a new conversation (this contract exists because an
+early LCM build lost its DAG lineage at every compaction). An engine that
+raises from this hook does not break compression — the host swallows the
+error and continues.
+
+Host persistence guarantees at the boundary (pinned by
+`tests/test_session_stability_compression.py` and
+`tests/run_agent/test_compression_boundary_hook.py`):
+
+- The message list returned by `compress()` is persisted to the **new
+  continuation session row**, even if a stale pre-compression history is
+  still floating around in a finalizer (the DB flush cursor is scoped by
+  session id).
+- The rotation bookkeeping is applied immediately after the id swap, before
+  any fallible session-DB call that follows it (continuation-row creation,
+  title propagation), so a transient SQLite failure mid-split cannot strand
+  the continuation row as an accounting-only record (token counters but
+  zero messages). A failure *before* the swap aborts the whole split — no
+  rotation happens at all.
+- Engines cannot rotate the session id themselves — no host→engine call
+  ever passes the agent object or the session-DB handle (engines see only
+  plain data: ids, messages, usage, model/config metadata), so all engines
+  (built-in and plugin) share the same hardened rotation path.
 
 ## Configuration
 

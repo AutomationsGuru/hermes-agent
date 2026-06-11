@@ -31,6 +31,7 @@ class TestSaveConfigValueAtomic:
         save_config_value("display.skin", "mono")
 
         mock_update.assert_called_once_with(config_env, "display.skin", "mono")
+        assert config_env.with_name("config.yaml.lock").exists()
 
     def test_preserves_existing_keys(self, config_env):
         """Writing a new key must not clobber existing config entries."""

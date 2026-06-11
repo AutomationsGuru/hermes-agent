@@ -296,7 +296,39 @@ The `_sanitize_fts5_query()` method handles edge cases:
 ## Session Lineage
 
 Sessions can form chains via `parent_session_id`. This happens when context
-compression triggers a session split in the gateway.
+compression triggers a session split (the old row is ended with
+`end_reason="compression"` and a continuation row is created), and also for
+`/branch` and delegated child sessions. A *compression edge* is
+distinguished from branch/delegate parentage by the parent's
+`end_reason == "compression"` plus time ordering (`child.started_at >=
+parent.ended_at`) — lineage walks must use that test, not
+`parent_session_id` alone.
+
+### Structural tip vs message-bearing tip
+
+Two helpers resolve "the end of a chain", with different semantics:
+
+- `get_compression_tip(session_id)` — the **structural** tip: the newest
+  continuation row, used for live routing (where new messages go).
+- `get_message_bearing_tip(session_id)` — the newest segment that actually
+  has message rows, used for user-facing surfaces (open/read/search).
+
+They can differ: a failed flush historically produced *accounting-only*
+continuation rows — `api_call_count`/token counters but zero persisted
+messages. `list_sessions_rich(min_message_count=N)` re-applies the filter
+**after** compression-tip projection and falls back to the message-bearing
+segment, so callers that ask for non-empty sessions never receive a
+projected empty tip. Projected rows carry `_lineage_root_id` and
+`_structural_tip_id` so callers keep the full chain context. Existing
+accounting-only rows can be audited/quarantined with
+`scripts/audit_empty_sessions.py` (dry-run by default; archives and stamps
+`_empty_continuation` in `model_config`, never deletes).
+
+The DB message-flush cursor in the agent is scoped by session id: after a
+compression rotation the flush layer ignores any stale pre-compression
+conversation history, so the compressed transcript is always written to the
+continuation row (regression-tested in
+`tests/test_session_stability_compression.py`).
 
 ### Query: Find Session Lineage
 

@@ -507,6 +507,26 @@ def compress_context(
             agent._session_db.end_session(agent.session_id, "compression")
             old_session_id = agent.session_id
             agent.session_id = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
+            # Reset the flush cursor and flag the rotation IMMEDIATELY after
+            # the id swap, before any fallible session-DB call below. Both
+            # are pure in-memory assignments that cannot raise. If they sat
+            # after create_session()/update_system_prompt() (as they once
+            # did) a transient SQLite failure in between would leave the id
+            # rotated with a stale cursor and no rotation flag — the next
+            # flush would then skip every message while token counters kept
+            # accruing on the new row, recreating the #15000 accounting-only
+            # continuation shape this flag exists to prevent. The rotation
+            # flag also tells _flush_messages_to_session_db to ignore any
+            # stale pre-compression conversation_history a finalizer or
+            # error path may still pass (it belongs to the OLD session row).
+            agent._last_flushed_db_idx = 0
+            agent._session_rotated_since_flush = True
+            # Keep the agent's parent pointer in sync with the rotation so a
+            # failed create_session below can be retried by
+            # _ensure_db_session with the correct compression-lineage parent
+            # (it reads self._parent_session_id) instead of the agent's
+            # original, pre-compression parent.
+            agent._parent_session_id = old_session_id
             # Ordering contract: the agent thread updates the contextvar here;
             # the gateway propagates to SessionEntry after run_in_executor returns.
             try:
@@ -547,8 +567,6 @@ def compress_context(
                 except (ValueError, Exception) as e:
                     logger.debug("Could not propagate title on compression: %s", e)
             agent._session_db.update_system_prompt(agent.session_id, new_system_prompt)
-            # Reset flush cursor — new session starts with no messages written
-            agent._last_flushed_db_idx = 0
         except Exception as e:
             logger.warning("Session DB compression split failed — new session will NOT be indexed: %s", e)
 
