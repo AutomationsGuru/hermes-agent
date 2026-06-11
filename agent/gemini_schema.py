@@ -87,6 +87,26 @@ def sanitize_gemini_schema(schema: Any) -> Dict[str, Any]:
         if any(not isinstance(item, str) for item in enum_val):
             cleaned.pop("enum", None)
 
+    # Gemini protobuf-validation hardening (applied at every nesting level since
+    # this function recurses). Two fixes adapted from the MIT-licensed
+    # opencode-antigravity-auth (c) 2025 Jens, which surfaced both as concrete
+    # Code Assist errors:
+    #   * "parameters.required[X]: property X is not defined" — keep only
+    #     ``required`` entries that name a real property; drop the key if none.
+    #   * "parameters.properties[X].items: missing field" — an array schema must
+    #     declare ``items``; supply a permissive default when it was omitted.
+    required = cleaned.get("required")
+    if isinstance(required, list):
+        props = cleaned.get("properties")
+        known = set(props) if isinstance(props, dict) else set()
+        filtered = [name for name in required if name in known]
+        if filtered:
+            cleaned["required"] = filtered
+        else:
+            cleaned.pop("required", None)
+    if cleaned.get("type") == "array" and "items" not in cleaned:
+        cleaned["items"] = {"type": "string"}
+
     return cleaned
 
 
