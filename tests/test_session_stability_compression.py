@@ -1,6 +1,6 @@
 """Regression tests for compression-related session stability.
 
-Covers the two bugs evidenced on 2026-06-10 (see
+Covers the bugs evidenced on 2026-06-10 (see
 ``plans/session-stability-improvement-2026-06-10.md`` and issue #15000):
 
 1. ``SessionDB.list_sessions_rich(min_message_count=N)`` applied the filter
@@ -18,9 +18,20 @@ Covers the two bugs evidenced on 2026-06-10 (see
    than the compressed message list, zero rows are appended to the new
    session while token counters keep accruing — producing the empty
    usage-bearing continuation rows in state.db.
+
+3. The rotation block in ``compress_context`` originally performed the
+   cursor reset / rotation flagging AFTER its fallible session-DB calls
+   (``create_session`` / ``update_system_prompt``). A transient SQLite
+   failure in between left the id rotated with stale bookkeeping — the
+   same #15000 shape via a different door. The bookkeeping now happens
+   immediately after the id swap; ``TestRotationBlockFailureWindow``
+   pins it, including through the plugin-context-engine (hermes-lcm
+   shaped) strict-signature ``compress`` fallback.
 """
 
+import os
 import time
+from unittest.mock import patch
 
 import pytest
 
@@ -307,5 +318,180 @@ class TestFlushCursorScopedBySession:
             _flush(probe, compressed, stale_history)
 
             assert len(db.get_messages("contsid")) == 2
+        finally:
+            db.close()
+
+    def test_cursor_beyond_message_list_warns_and_clamps(self, tmp_path, caplog):
+        """A flush cursor past the end of the live message list is only
+        producible by a failed rotation or an engine shrinking the list in
+        place — the precursor state to #15000. It must warn, not skip into
+        negative-slice territory or crash."""
+        import logging
+
+        db = self._make_db_with_root(tmp_path)
+        try:
+            probe = _FlushProbe(db, "rootsid")
+            probe._last_flushed_session_id = "rootsid"
+            probe._last_flushed_db_idx = 10  # cursor from a longer, older list
+
+            short = [{"role": "user", "content": "post-shrink"}]
+            with caplog.at_level(logging.WARNING):
+                _flush(probe, short)
+
+            assert any("flush cursor" in r.message.lower() for r in caplog.records)
+            # Cursor re-anchored to the live list; no rows written (the rows
+            # the cursor pointed past were never these messages).
+            assert probe._last_flushed_db_idx == 1
+            assert db.get_messages("rootsid") == []
+        finally:
+            db.close()
+
+
+# ---------------------------------------------------------------------------
+# Bug 3 — rotation bookkeeping must survive transient DB failures, for the
+# built-in compressor AND plugin context engines (hermes-lcm shaped)
+# ---------------------------------------------------------------------------
+
+
+class _PluginShapedEngine:
+    """Context engine with the EXACT published plugin contract surface
+    (https://hermes-agent.nousresearch.com/docs/developer-guide/context-engine-plugin):
+    strict ``compress(messages, current_tokens=None)`` signature — no
+    ``focus_topic`` / ``force`` — so the host must take its TypeError
+    fallback path, exactly as it does for hermes-lcm."""
+
+    name = "lcm-shaped-test-engine"
+    last_prompt_tokens = 0
+    last_completion_tokens = 0
+    last_total_tokens = 0
+    threshold_tokens = 0
+    context_length = 200_000
+    compression_count = 0
+    _last_compress_aborted = False
+    _last_summary_error = None
+
+    def __init__(self):
+        self.session_start_calls = []
+        self.strict_calls = 0
+
+    def compress(self, messages, current_tokens=None):
+        self.strict_calls += 1
+        self.compression_count += 1
+        return [
+            {"role": "user", "content": "[CONTEXT COMPACTION] lcm summary"},
+            {"role": "user", "content": "tail question"},
+        ]
+
+    def should_compress(self, prompt_tokens=None):
+        return False
+
+    def update_from_response(self, usage):
+        pass
+
+    def on_session_start(self, session_id, **kwargs):
+        self.session_start_calls.append((session_id, kwargs))
+
+
+class TestRotationBlockFailureWindow:
+    def _make_agent(self, db, session_id="original-session"):
+        with patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-key"}):
+            from run_agent import AIAgent
+            return AIAgent(
+                api_key="test-key",
+                base_url="https://openrouter.ai/api/v1",
+                model="test/model",
+                quiet_mode=True,
+                session_db=db,
+                session_id=session_id,
+                skip_context_files=True,
+                skip_memory=True,
+            )
+
+    def test_create_session_failure_no_longer_strands_cursor(self, tmp_path):
+        """THE failure window: create_session raises (transient SQLite lock)
+        inside the rotation block AFTER the id swap. The cursor reset and
+        rotation flag must already be in place, and the next flush must
+        retry row creation and write the compressed messages — instead of
+        producing a usage-bearing row with zero messages (#15000)."""
+        import sqlite3 as _sqlite3
+
+        db = SessionDB(db_path=tmp_path / "state.db")
+        try:
+            agent = self._make_agent(db)
+            engine = _PluginShapedEngine()
+            agent.context_compressor = engine
+            original_sid = agent.session_id
+
+            # Seed the original session like a real first turn, advancing
+            # the cursor past what the compressed list will hold.
+            history = [{"role": "user", "content": f"m{i}"} for i in range(8)]
+            agent._ensure_db_session()
+            agent._flush_messages_to_session_db(history)
+            assert agent._last_flushed_db_idx == 8
+
+            def failing_create(*args, **kwargs):
+                raise _sqlite3.OperationalError("database is locked")
+
+            with patch.object(db, "create_session", side_effect=failing_create):
+                compressed, _sp = agent._compress_context(
+                    list(history), "sys", approx_tokens=10_000
+                )
+
+            # Id rotated; bookkeeping survived the create_session failure.
+            assert agent.session_id != original_sid
+            assert agent._session_rotated_since_flush is True
+            assert agent._last_flushed_db_idx == 0
+            assert agent._session_db_created is False
+            # Retry path must carry the compression-lineage parent.
+            assert agent._parent_session_id == original_sid
+
+            # Finalizer passes the STALE pre-compression history; the flush
+            # must retry row creation and still write the compressed rows.
+            agent._flush_messages_to_session_db(compressed, history)
+            rows = db.get_messages(agent.session_id)
+            assert len(rows) == len(compressed), (
+                "compressed messages were not persisted to the continuation "
+                "session after a transient create_session failure"
+            )
+            child = db.get_session(agent.session_id)
+            assert child["parent_session_id"] == original_sid
+        finally:
+            db.close()
+
+    def test_plugin_engine_happy_path_rotation_bookkeeping(self, tmp_path):
+        """hermes-lcm shaped engine, no failures: rotation goes through the
+        strict-signature compress fallback, sets the rotation bookkeeping,
+        fires the compression boundary hook, and a stale-history flush
+        writes the compressed messages to the child row."""
+        db = SessionDB(db_path=tmp_path / "state.db")
+        try:
+            agent = self._make_agent(db)
+            engine = _PluginShapedEngine()
+            agent.context_compressor = engine
+            original_sid = agent.session_id
+
+            history = [{"role": "user", "content": f"m{i}"} for i in range(8)]
+            agent._ensure_db_session()
+            agent._flush_messages_to_session_db(history)
+
+            compressed, _sp = agent._compress_context(
+                list(history), "sys", approx_tokens=10_000
+            )
+
+            assert engine.strict_calls == 1, (
+                "host must fall back to the strict plugin compress signature"
+            )
+            assert agent.session_id != original_sid
+            assert agent._session_rotated_since_flush is True
+            assert agent._last_flushed_db_idx == 0
+            # Boundary hook still fired for the plugin engine (hermes-lcm#68).
+            comp_calls = [
+                (sid, kw) for sid, kw in engine.session_start_calls
+                if kw.get("boundary_reason") == "compression"
+            ]
+            assert comp_calls and comp_calls[-1][0] == agent.session_id
+
+            agent._flush_messages_to_session_db(compressed, history)
+            assert len(db.get_messages(agent.session_id)) == len(compressed)
         finally:
             db.close()

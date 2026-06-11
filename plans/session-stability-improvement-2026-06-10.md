@@ -3,6 +3,9 @@
 Generated: 2026-06-10 00:12 MDT
 Repo: C:/Users/RDP/.hermes/hermes-agent
 DB inspected: C:/Users/RDP/.hermes/state.db
+Status: in-flight (implementation + continuation complete and tested on
+branch `session-stability-improvement`; landing/decision-doc promotion
+pending Matthew's go — see Addendum)
 
 ## Goal
 
@@ -413,3 +416,81 @@ Run a focused smoke after implementation:
 2. Should accounting-only rows remain visible in an advanced diagnostics view?
 3. Should existing JSON session logs be treated as authoritative enough for backfill, or only for manual recovery?
 4. Should `resolve_resume_session_id()` change to prefer descendant-with-messages, then ancestor-with-messages, then raw target?
+
+## Addendum — 2026-06-10 continuation session
+
+Status of the original phases: 0–4 implemented and tested; Phase 3
+quarantine applied to the live DB (12 rows `[MARKED,ARCHIVED]`, audit
+script idempotent). Live validation on a copy of state.db: zero empty
+tips leak past `min_message_count=1`; the documented bad chain surfaces
+its 167-message segment.
+
+Additional work landed in this continuation:
+
+### Rotation-block failure window (adversarially verified)
+
+A transient session-DB failure (`create_session` /
+`update_system_prompt` raising, e.g. SQLite lock) inside
+`compress_context`'s rotation block left `agent.session_id` rotated but
+the flush cursor/rotation flag stale — recreating the #15000
+accounting-only shape through a different door. Fixes:
+
+- `agent/conversation_compression.py`: cursor reset + rotation flag (+
+  `_parent_session_id` sync for correct lineage on the
+  `_ensure_db_session` retry) moved to immediately after the id swap,
+  before any fallible DB call.
+- `run_agent.py`: flush warns and clamps when the cursor exceeds the
+  live message list (only producible by a failed rotation or an engine
+  shrinking the list in place).
+- `tests/test_session_stability_compression.py::TestRotationBlockFailureWindow`
+  pins both, including through the PLUGIN context-engine
+  (hermes-lcm shaped) strict-signature `compress` fallback — binding the
+  LCM path to the stability guarantees. Verified to fail without the fix.
+
+Plugin engines cannot rotate sessions themselves (verified: no host→engine
+call hands the agent over), so all engines share this hardened block.
+
+### Mission Control agent-logs bridge
+
+`scripts/agent_logs_bridge.py` materializes `~/.hermes/agent-logs.db`
+(table `agent_logs(agent_name, task_description, model_used, status,
+created_at)`) from session history across the default + profile lanes,
+collapsing compression chains to one logical task row via the same
+lineage-edge test as the SessionDB walks. Deployed live: Mission
+Control's snapshot flipped from "degraded / agent-logs.db" to
+`available: true, rows_sampled: 128`. Refresh is manual or a
+`--no-agent` cron job. Tests:
+`tests/scripts/test_agent_logs_bridge.py` (pins Mission Control's
+parse/status/read-pattern contract).
+
+### Test hygiene
+
+- `tests/run_agent/test_compression_boundary_hook.py`: close SessionDB
+  before TemporaryDirectory cleanup (pre-existing WinError 32 flake).
+- `tests/hermes_cli/test_config.py` subprocess lock test: widened
+  hold/threshold margins (flaked under full-suite load).
+
+### Documentation updates (2026-06-10, same continuation session)
+
+- `website/docs/developer-guide/context-engine-plugin.md`: new
+  "Compression boundaries" section — documents the
+  `on_session_start(new_sid, boundary_reason="compression",
+  old_session_id=...)` kwargs and the host persistence guarantees.
+- `website/docs/developer-guide/context-compression-and-caching.md`: new
+  "Session Store at the Compression Boundary" section.
+- `website/docs/developer-guide/agent-loop.md`: compression step 6 — child
+  transcript persistence.
+- `website/docs/developer-guide/session-storage.md`: compression-edge test,
+  structural vs message-bearing tip, post-projection `min_message_count`,
+  audit script.
+- `website/docs/reference/cli-commands.md` (+ the zh-Hans translation of
+  the same section): Windows-safe multi-process log rotation (lock +
+  copy-truncate).
+- `website/docs/user-guide/features/web-dashboard.md`: `/api/sessions`
+  params + `/api/sessions/search` response shape (message-bearing
+  `session_id`, `lineage_root`, `structural_tip`, lineage dedupe).
+- `LOCAL_AGENTS.md`: working-tree snapshot, fork-local surfaces
+  (agent_logs_bridge + tests), sensitive-data rule for the bridge.
+- Mission Control (`agent-os-project-packages/apps/mission-control/`):
+  HANDOFF.md section 0c + known-gaps bullet resolved; README.md Agents
+  paragraph notes the writer.

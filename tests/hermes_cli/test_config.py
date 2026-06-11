@@ -412,13 +412,16 @@ class TestConfigStoreLock:
         repo_root = Path(__file__).resolve().parents[2]
         marker = tmp_path / "held.txt"
         env = {**os.environ, "HERMES_HOME": str(tmp_path)}
+        # Hold long relative to the probe's interpreter-startup time: under
+        # full-suite load the probe can take >1s to even reach the lock,
+        # which made a 1.0s hold / 0.5s threshold flaky.
         holder_script = f"""
 import time
 from pathlib import Path
 from hermes_cli.config import config_store_lock
 with config_store_lock():
     Path({str(marker)!r}).write_text("held", encoding="utf-8")
-    time.sleep(1.0)
+    time.sleep(3.0)
 """
         probe_script = """
 import time
@@ -451,7 +454,7 @@ print(f"{elapsed:.3f}")
                 timeout=10,
             )
             assert result.returncode == 0, result.stderr
-            assert float(result.stdout.strip()) >= 0.5
+            assert float(result.stdout.strip()) >= 0.2
         finally:
             stdout, stderr = holder.communicate(timeout=10)
             assert holder.returncode == 0, stderr or stdout

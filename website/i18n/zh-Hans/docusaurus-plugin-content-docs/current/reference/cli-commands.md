@@ -750,7 +750,9 @@ hermes logs --level WARNING --since 2h --session tg-12345
 
 ### 日志轮转
 
-Hermes 使用 Python 的 `RotatingFileHandler`。旧日志会自动轮转——查找 `agent.log.1`、`agent.log.2` 等。`hermes logs list` 子命令显示所有日志文件，包括已轮转的。
+Hermes 会在达到配置的大小阈值时自动轮转日志——查找 `agent.log.1`、`agent.log.2` 等。`hermes logs list` 子命令显示所有日志文件，包括已轮转的。
+
+多个 Hermes 进程同时写同一日志文件时轮转也是安全的：轮转通过跨进程锁（`<日志文件>.rollover.lock`）串行化；在 Windows 上，活动日志文件会被**复制到备份槽位并原地截断**，而不是重命名——重命名一个被其他进程持有的日志文件会因 `WinError 32` 失败。轮转失败永远不会中断日志记录；处理器会继续写入，并在之后的写入时重试轮转。
 
 ## `hermes config`
 

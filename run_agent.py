@@ -1565,6 +1565,20 @@ class AIAgent:
                 # paths position the cursor themselves (compression resets it
                 # to 0; /branch sets it to the copied-history length).
                 flush_from = self._last_flushed_db_idx
+                if flush_from > len(messages):
+                    # A cursor beyond the live message list means the list
+                    # was replaced/shrunk without the rotation bookkeeping
+                    # (e.g. a rotation block that failed midway, or a context
+                    # engine mutating the list in place). Surface it — this
+                    # is the precursor state to #15000 usage-without-messages
+                    # rows — and clamp so slicing semantics stay explicit.
+                    logger.warning(
+                        "Session flush cursor (%d) exceeds message list (%d) "
+                        "for session %s — possible failed session rotation; "
+                        "see #15000.",
+                        flush_from, len(messages), self.session_id,
+                    )
+                    flush_from = len(messages)
             else:
                 # First flush for this session in this agent instance
                 # (fresh/resumed agent): skip the already-persisted history

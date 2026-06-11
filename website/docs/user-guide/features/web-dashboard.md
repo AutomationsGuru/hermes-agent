@@ -355,7 +355,7 @@ Returns agent version, gateway status, platform states, and active session count
 
 ### GET /api/sessions
 
-Returns the 20 most recent sessions with metadata (model, token counts, timestamps, preview).
+Returns recent sessions with metadata (model, token counts, timestamps, preview). Query parameters: `limit`, `offset`, `min_messages` (only sessions with at least N messages — applied after compression-chain projection, so an empty continuation tip can never satisfy it), `archived` (`include` or `only`), `order` (`recent` orders by last activity), `source`, and `exclude_sources` (comma-separated). Response envelope: `{"sessions": [...], "total", "limit", "offset"}`; each session row adds `is_active` and a boolean `archived`. Compression chains appear as one logical entry.
 
 ### GET /api/config
 
@@ -395,7 +395,7 @@ Returns the full message history for a session, including tool calls and timesta
 
 ### GET /api/sessions/search
 
-Full-text search across message content. Query parameter: `q`. Returns matching session IDs with highlighted snippets.
+Searches sessions by ID and by full-text message content (FTS5). Query parameters: `q`, `limit`. Direct session-ID matches surface first; results are deduplicated by compression lineage, so one logical conversation appears once even if compression split it across several session rows. Each result carries `session_id` (the newest **message-bearing** segment of the chain — the one to open/read), `lineage_root` (the chain's root id), `structural_tip` (the newest chain segment regardless of message count), plus `snippet`, `role`, `source`, `model`, and `session_started`.
 
 ### DELETE /api/sessions/\{session_id\}
 
