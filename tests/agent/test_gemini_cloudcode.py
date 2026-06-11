@@ -1249,25 +1249,33 @@ class TestGeminiCloudCodeClient:
             {"tool_choice": {"type": "function", "function": {"name": "lookup"}}},
         ],
     )
-    def test_antigravity_cascade_rejects_tool_modes_on_non_target_model(self, kwargs):
-        # antigravity-cascade is the Gemini/Flash route — tool calling is gated
-        # to the cross-vendor targets only, so tool modes here still raise.
+    def test_antigravity_non_target_model_degrades_tools_to_chat(self, monkeypatch, kwargs):
+        # antigravity-cascade is the Gemini/Flash route — not tool-capable here.
+        # An agent harness (e.g. Hermes Desktop) sends tools on EVERY request, so
+        # instead of hard-erroring we drop the tools and serve as plain chat.
+        self._patch_cascade_client(
+            monkeypatch,
+            [
+                SimpleNamespace(type="assistant_text", text="hello from chat"),
+                SimpleNamespace(type="done", text="", conversation_done=True),
+            ],
+        )
         from agent.gemini_cloudcode_adapter import GeminiCloudCodeClient
-        from agent.google_code_assist import CodeAssistError
 
         client = GeminiCloudCodeClient(api_key="dummy")
         try:
-            with pytest.raises(CodeAssistError) as exc_info:
-                client.chat.completions.create(
-                    model="antigravity-cascade",
-                    messages=[{"role": "user", "content": "hi"}],
-                    **kwargs,
-                )
+            resp = client.chat.completions.create(
+                model="antigravity-cascade",
+                messages=[{"role": "user", "content": "hi"}],
+                **kwargs,
+            )
         finally:
             client.close()
 
-        assert exc_info.value.code == "antigravity_cascade_tools_unsupported"
-        assert "gpt-oss-120b-medium" in str(exc_info.value)
+        # No hard error — degrades to a normal chat response, no tool calls.
+        assert resp.choices[0].message.content == "hello from chat"
+        assert resp.choices[0].finish_reason == "stop"
+        assert resp.choices[0].message.tool_calls is None
 
     @staticmethod
     def _fake_cascade_client_class(events):
@@ -1870,29 +1878,30 @@ class TestAntigravityToolCallingRoute:
         assert resp.choices[0].message.tool_calls is None
         assert "delivery" in (resp.choices[0].message.content or "")
 
-    def test_claude_models_are_chat_only_for_tools(self, monkeypatch):
-        # Claude models are gated OUT of tool calling (they don't reliably emit
-        # tool calls over the Cascade route); requesting tools gives a clear,
-        # chat-only error rather than hanging a real agent loop.
+    def test_claude_models_degrade_tools_to_chat(self, monkeypatch):
+        # Claude models are chat-only here (they don't reliably emit tool calls
+        # over the Cascade route). An agent harness sends tools on every request,
+        # so we must NOT hard-error — we drop the tools and serve plain chat, so
+        # the model stays usable in agent UIs (e.g. Hermes Desktop).
         from agent.gemini_cloudcode_adapter import GeminiCloudCodeClient
-        from agent.google_code_assist import CodeAssistError
 
         for model in (
             "antigravity-claude-sonnet-4-6",
             "antigravity-claude-opus-4-6-thinking",
         ):
+            self._patch(monkeypatch, ["plain chat answer"])
             client = GeminiCloudCodeClient(api_key="dummy")
             try:
-                with pytest.raises(CodeAssistError) as exc_info:
-                    client.chat.completions.create(
-                        model=model,
-                        messages=[{"role": "user", "content": "hi"}],
-                        tools=self._TOOLS,
-                    )
+                resp = client.chat.completions.create(
+                    model=model,
+                    messages=[{"role": "user", "content": "hi"}],
+                    tools=self._TOOLS,
+                )
             finally:
                 client.close()
-            assert exc_info.value.code == "antigravity_cascade_tools_unsupported"
-            assert "chat" in str(exc_info.value).lower()
+            assert resp.choices[0].finish_reason == "stop", model
+            assert resp.choices[0].message.content == "plain chat answer", model
+            assert resp.choices[0].message.tool_calls is None, model
 
     def test_streaming_tool_call_emits_tool_calls_chunk(self, monkeypatch):
         from agent.gemini_cloudcode_adapter import GeminiCloudCodeClient
