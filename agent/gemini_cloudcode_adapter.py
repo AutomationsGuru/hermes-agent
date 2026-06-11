@@ -1399,23 +1399,29 @@ class GeminiCloudCodeClient:
         """
 
         tool_names = set(_antigravity_tool_names(tools))
-        wants_tools = bool(tool_names) or _tool_choice_forces_tools(tool_choice)
-        if wants_tools and model_enum not in ANTIGRAVITY_TOOL_ENABLED_ENUMS:
+        if tool_names and model_enum not in ANTIGRAVITY_TOOL_ENABLED_ENUMS:
+            # This model isn't reliable for tool calling over the Cascade route
+            # (Claude/Opus fight Antigravity's agent persona; Gemini presets are
+            # served for chat here — use the normal google provider for Gemini
+            # tools). Agent harnesses (e.g. Hermes Desktop) send `tools` on EVERY
+            # request, so hard-erroring would make these models unusable even for
+            # chat. Instead, degrade gracefully: drop the tools and serve as plain
+            # chat. The model answers in text rather than calling tools.
             if model_enum in ANTIGRAVITY_TOOL_UNRELIABLE_ENUMS:
-                raise CodeAssistError(
-                    "This Antigravity Claude model is available for chat but not "
-                    "for tool calling: wrapped in Antigravity's agent persona it "
-                    "does not reliably emit tool calls over the Cascade route. Use "
-                    "antigravity-gpt-oss-120b-medium for tool-using agent loops, "
-                    "or this model for plain chat.",
-                    code="antigravity_cascade_tools_unsupported",
+                logger.info(
+                    "Antigravity Claude model %s is chat-only; ignoring %d tool(s) "
+                    "and serving as plain chat.",
+                    model_enum,
+                    len(tool_names),
                 )
-            raise CodeAssistError(
-                "Antigravity Cascade tool calling is supported only for "
-                "antigravity-gpt-oss-120b-medium. For Gemini, use the normal "
-                "google provider's tool calling.",
-                code="antigravity_cascade_tools_unsupported",
-            )
+            else:
+                logger.info(
+                    "Antigravity model %s does not support tool calling here; "
+                    "ignoring %d tool(s) and serving as plain chat.",
+                    model_enum,
+                    len(tool_names),
+                )
+            tool_names = set()
         if not tool_names:
             # Plain text/chat — unchanged streaming or non-stream behavior.
             # (A tool_choice with no tools list is a no-op on this route.)
